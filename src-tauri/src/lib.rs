@@ -842,7 +842,12 @@ async fn gen_ollama_stream(
 
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
-        let mut child = spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true))?;
+        let mut child = spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true))
+            .map_err(|e| {
+                // Cleanup on spawn failure
+                registry.remove(&stream_topic);
+                e
+            })?;
         // tracked so the Stop button (cancel_stream) can end the request
         registry.insert(stream_topic.clone(), child.id());
 
@@ -868,7 +873,11 @@ async fn gen_ollama_stream(
             }
         }
 
-        let status = child.wait().map_err(|e| format!("wait error: {}", e))?;
+        let status = child.wait().map_err(|e| {
+            // Cleanup registry on wait failure
+            registry.remove(&stream_topic);
+            format!("wait error: {}", e)
+        })?;
         let _ = app.emit(&stream_topic, StreamChunk { chunk: "", done: true });
         registry.remove(&stream_topic);
         if let Some(e) = err_msg { return Err(format!("ollama: {}", e)); }
@@ -1041,7 +1050,11 @@ async fn run_kosmos_stream(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("failed to spawn ri1-cli: {}", e))?;
+            .map_err(|e| {
+                // Cleanup on spawn failure
+                registry.remove(&stream_topic);
+                format!("failed to spawn ri1-cli: {}", e)
+            })?;
         let pid = child.id();
         registry.insert(stream_topic.clone(), pid);
 
@@ -1076,7 +1089,11 @@ async fn run_kosmos_stream(
         // join stderr reader
         if let Some(h) = stderr_handle_opt { let _ = h.join(); }
 
-        let status = child.wait().map_err(|e| format!("wait error: {}", e))?;
+        let status = child.wait().map_err(|e| {
+            // Cleanup registry on wait failure
+            registry.remove(&stream_topic);
+            format!("wait error: {}", e)
+        })?;
         let _ = app.emit(&stream_topic, KosmosChunk { chunk: "", done: true });
         registry.remove(&stream_topic);
         if status.success() { Ok(()) } else { Err(format!("ri1-cli exited with status: {}", status)) }
@@ -1160,7 +1177,14 @@ async fn gen_ri1_stream(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|e| format!("failed to spawn ri1-cli: {}", e))?;
+            .map_err(|e| {
+                // Cleanup on spawn failure
+                registry.remove(&topic);
+                format!("failed to spawn ri1-cli: {}", e)
+            })?;
+
+        // Register immediately after spawning so cancellation can find it
+        registry.insert(topic.clone(), child.id());
 
         // stderr streamer
         let mut stderr_handle_opt = None;

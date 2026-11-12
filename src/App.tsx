@@ -1021,9 +1021,13 @@ function App() {
         await invoke("cancel_stream", { stream_id: currentStream.id, backend: currentStream.backend });
       }
     } catch {}
-    setLoading(false);
+    // Clear stream state on cancellation
+    if (unlistenRef.current) {
+      unlistenRef.current();
+      unlistenRef.current = null;
+    }
     setCurrentStream(null);
-    if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null; }
+    setLoading(false);
   }
 
   function lastUserMessage(): Msg | null {
@@ -1036,8 +1040,12 @@ function App() {
   function retryLast() {
     const last = lastUserMessage();
     if (!last) return;
+    // Set prompt and immediately send - React state updates are batched
     setPrompt(last.text);
-    void send();
+    // Use requestAnimationFrame to ensure state is updated before send
+    requestAnimationFrame(() => {
+      void send();
+    });
   }
 
   function editAndResend() {
@@ -1293,15 +1301,28 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
         await invoke("gen_ollama_stream", { prompt: fullPrompt, model, streamId });
       }
     } catch (e: any) {
-      // Fallback to non-streaming
-      try {
-        const fallbackModel = model || "ri1-llama:desktop";
-        const out = await invoke<string>(useRi1 ? "gen_ri1_stream" : "gen_ollama", useRi1 ? { prompt: fullPrompt, model: fallbackModel, ri1CliPath: settings.ri1CliPath || undefined, streamId: mkStreamId() } : { prompt: fullPrompt, model: fallbackModel });
-        updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: out } : m)));
-        void ingestProtocolIfPresent(out);
-      } catch (ee: any) {
-        setError(ee?.toString?.() ?? e?.toString?.() ?? "Unknown error");
-      } finally {
+      // Fallback to non-streaming for Ollama only
+      // RI1 has no non-streaming fallback, so just show error
+      if (!useRi1) {
+        try {
+          const fallbackModel = model || "ri1-llama:desktop";
+          const out = await invoke<string>("gen_ollama", { prompt: fullPrompt, model: fallbackModel });
+          updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: out } : m)));
+          void ingestProtocolIfPresent(out);
+        } catch (ee: any) {
+          setError(ee?.toString?.() ?? e?.toString?.() ?? "Unknown error");
+        } finally {
+          setLoading(false);
+          if (unlistenRef.current) {
+            unlistenRef.current();
+            unlistenRef.current = null;
+          }
+          setCurrentStream(null);
+          setPrompt("");
+        }
+      } else {
+        // RI1 streaming failed - show error without fallback
+        setError(e?.toString?.() ?? "RI1 streaming failed");
         setLoading(false);
         if (unlistenRef.current) {
           unlistenRef.current();
