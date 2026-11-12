@@ -940,12 +940,6 @@ async fn check_ollama(endpoint: Option<String>) -> Result<OllamaHealth, String> 
     }
 }
 
-#[derive(serde::Serialize, Clone)]
-struct KosmosChunk<'a> {
-    chunk: &'a str,
-    done: bool,
-}
-
 // Stream `ri1-cli kosmos` stdout to the frontend. Minimal flags supported.
 #[tauri::command]
 async fn run_kosmos_stream(
@@ -963,7 +957,6 @@ async fn run_kosmos_stream(
     let registry = state.inner().clone();
     tauri::async_runtime::spawn_blocking(move || {
         use std::env;
-        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 
         fn find_ri1_cli(override_path: Option<String>) -> Option<String> {
@@ -1025,63 +1018,30 @@ async fn run_kosmos_stream(
         if let Some(m) = ollama_model { args.push("--ollama-model".into()); args.push(m); }
 
         let ri1_bin = find_ri1_cli(ri1_cli_path).ok_or_else(|| "could not find 'ri1-cli' in PATH or common locations; set RI1_CLI_PATH to override".to_string())?;
-        let mut child = Command::new(ri1_bin)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                // Cleanup on spawn failure
-                registry.remove(&stream_topic);
-                format!("failed to spawn ri1-cli: {}", e)
-            })?;
-        let pid = child.id();
-        registry.insert(stream_topic.clone(), pid);
 
-        // Spawn stderr reader
-        let mut stderr_handle_opt = None;
-        if let Some(stderr) = child.stderr.take() {
-            let topic_clone = stream_topic.clone();
-            let app_for_stderr = app.clone();
-            stderr_handle_opt = Some(std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(l) = line {
-                        let msg = format!("[err] {}", l);
-                        let _ = app_for_stderr.emit(&topic_clone, KosmosChunk { chunk: &msg, done: false });
-                    } else {
-                        break;
-                    }
-                }
-            }));
-        }
+        // Create Tauri callback for event emission
+        let callback = Arc::new(TauriStreamCallback {
+            app: app.clone(),
+        });
 
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => { let _ = app.emit(&stream_topic, KosmosChunk { chunk: &l, done: false }); },
-                    Err(_) => break,
-                }
-            }
-        }
+        // Use shared subprocess lifecycle
+        let config = SubprocessConfig {
+            command: ri1_bin,
+            args,
+            topic: stream_topic.clone(),
+            registry: registry.clone(),
+            callback,
+            stdin_null: true,
+            stdout_piped: true,
+            stderr_piped: true,
+            simulate_wait_error: false,
+        };
 
-        // join stderr reader
-        if let Some(h) = stderr_handle_opt { let _ = h.join(); }
-
-        let status = child.wait().map_err(|e| {
-            // Cleanup registry on wait failure
-            registry.remove(&stream_topic);
-            format!("wait error: {}", e)
-        })?;
-        registry.remove(&stream_topic);
-        // Only emit done on success - failed exits should reach error handling
-        if status.success() {
-            let _ = app.emit(&stream_topic, KosmosChunk { chunk: "", done: true });
-            Ok(())
-        } else {
-            Err(format!("ri1-cli exited with status: {}", status))
+        let lifecycle = SubprocessLifecycle::new(config);
+        match lifecycle.execute()? {
+            SubprocessResult::Success => Ok(()),
+            SubprocessResult::Failure(err) => Err(err),
+            SubprocessResult::Cancelled => Ok(()), // Cancellation is not an error
         }
     })
     .await
@@ -1099,7 +1059,6 @@ struct Ri1Chunk<'a> {
 // Tauri callback implementation for StreamCallback
 struct TauriStreamCallback {
     app: tauri::AppHandle,
-    topic: String,
 }
 
 impl StreamCallback for TauriStreamCallback {
@@ -1178,7 +1137,6 @@ async fn gen_ri1_stream(
         // Create Tauri callback for event emission
         let callback = Arc::new(TauriStreamCallback {
             app: app.clone(),
-            topic: topic.clone(),
         });
 
         // Use shared subprocess lifecycle
@@ -1191,6 +1149,7 @@ async fn gen_ri1_stream(
             stdin_null: true,
             stdout_piped: true,
             stderr_piped: true,
+            simulate_wait_error: false,
         };
 
         let lifecycle = SubprocessLifecycle::new(config);

@@ -2,7 +2,6 @@
 // These tests exercise the actual production code from the subprocess module
 
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ri1_desktop_lib::subprocess::{
@@ -68,6 +67,7 @@ fn test_normal_completion_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -100,6 +100,7 @@ fn test_partial_output_failure_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -136,6 +137,7 @@ fn test_cancellation_during_startup_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn lifecycle in a thread
@@ -177,6 +179,7 @@ fn test_cancellation_running_child_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn lifecycle in a thread
@@ -221,6 +224,7 @@ fn test_repeated_cancellation_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn lifecycle in a thread
@@ -264,6 +268,7 @@ fn test_send_stop_send_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn first lifecycle
@@ -297,6 +302,7 @@ fn test_send_stop_send_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn second lifecycle
@@ -325,6 +331,7 @@ fn test_registry_cleanup_spawn_failure_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -334,54 +341,41 @@ fn test_registry_cleanup_spawn_failure_production() {
     assert!(registry.is_empty(), "Registry should be empty after spawn failure");
 }
 
-// Test 8: Wait error coverage using production lifecycle
+// Test 8: Wait error coverage using production lifecycle with simulated wait error
 #[test]
 fn test_wait_error_production() {
     let registry = ProcessRegistry::new();
     let stream_id = "test-wait-error-prod";
     let topic = create_topic("ri1", stream_id);
 
-    let (callback, _chunks, _errors) = create_test_callback();
+    let (callback, _chunks, errors) = create_test_callback();
 
     let config = SubprocessConfig {
         command: get_mock_cli_path().to_string_lossy().to_string(),
-        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
         topic: topic.clone(),
         registry: registry.clone(),
         callback,
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: true, // Simulate wait error through production path
     };
 
-    // Spawn lifecycle in a thread
     let lifecycle = SubprocessLifecycle::new(config);
-    let handle = std::thread::spawn(move || lifecycle.execute());
+    let result = lifecycle.execute();
 
-    // Wait for process to be registered
-    std::thread::sleep(Duration::from_millis(200));
+    // Should return error due to simulated wait error
+    assert!(result.is_err(), "Should fail with wait error");
+    assert!(result.unwrap_err().contains("Simulated wait error"), "Should contain wait error message");
 
-    // Get the PID and kill it externally to cause wait error
-    if let Some(pid) = registry.get(&topic) {
-        let _ = Command::new("kill")
-            .arg("-KILL")
-            .arg(format!("{}", pid))
-            .status();
-    }
-
-    // Wait for lifecycle to complete
-    let result = handle.join().expect("Thread join failed");
-
-    // Should be failure (process was killed)
-    assert!(result.is_ok(), "Lifecycle should complete");
-    if let Ok(SubprocessResult::Failure(_)) = result {
-        // Expected - process was killed
-    } else {
-        // Could also be cancelled if registry was cleaned up
-        assert!(matches!(result, Ok(SubprocessResult::Cancelled)), "Should be cancelled or failure");
-    }
-
+    // Registry should be cleaned up
     assert!(registry.is_empty(), "Registry should be empty after wait error");
+
+    // Error should be emitted through callback
+    let errors_guard = errors.lock().unwrap();
+    assert!(!errors_guard.is_empty(), "Should have error emitted");
+    assert!(errors_guard.iter().any(|(_, e)| e.contains("Simulated wait error")), "Should contain wait error");
 }
 
 // Test 9: Negative control - ineffective cancellation detection
@@ -402,6 +396,7 @@ fn test_negative_control_ineffective_cancellation_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Spawn lifecycle in a thread
@@ -457,6 +452,7 @@ fn test_multiple_concurrent_processes_production() {
             stdin_null: true,
             stdout_piped: true,
             stderr_piped: true,
+            simulate_wait_error: false,
         };
 
         let lifecycle = SubprocessLifecycle::new(config);
@@ -491,6 +487,7 @@ fn test_process_reaping_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -521,6 +518,7 @@ fn test_cancellation_before_registration_production() {
         stdin_null: true,
         stdout_piped: true,
         stderr_piped: true,
+        simulate_wait_error: false,
     };
 
     // Create a barrier to synchronize cancellation before registration
@@ -555,4 +553,188 @@ fn test_cancellation_before_registration_production() {
 
     // Registry should be cleaned up
     assert!(registry.is_empty(), "Registry should be empty");
+}
+
+// Test 13: Concurrent stdout/stderr draining with large stderr burst
+#[test]
+fn test_concurrent_drain_large_stderr_burst() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-concurrent-drain-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, chunks, _errors) = create_test_callback();
+
+    // Create a test script that writes large stderr burst before stdout
+    let test_script = r#"
+#!/bin/bash
+# Write large stderr burst first
+for i in {1..100}; do
+    echo "stderr line $i" >&2
+done
+# Then write stdout
+for i in {1..10}; do
+    echo "stdout line $i"
+done
+exit 0
+"#;
+
+    let script_path = std::env::temp_dir().join("test_stderr_burst.sh");
+    std::fs::write(&script_path, test_script).expect("Failed to write test script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+
+    let config = SubprocessConfig {
+        command: script_path.to_string_lossy().to_string(),
+        args: vec![],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+    };
+
+    let lifecycle = SubprocessLifecycle::new(config);
+    let start = std::time::Instant::now();
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
+    let elapsed = start.elapsed();
+
+    // Should complete within bounded timeout (5 seconds)
+    assert!(elapsed.as_secs() < 5, "Should complete within 5 seconds, took {:?}", elapsed);
+    assert!(matches!(result, SubprocessResult::Success), "Should succeed");
+    assert!(registry.is_empty(), "Registry should be empty");
+
+    // Verify both stdout and stderr chunks were emitted
+    let chunks_guard = chunks.lock().unwrap();
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("stdout line")), "Should have stdout chunks");
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("[err] stderr line")), "Should have stderr chunks");
+
+    // Cleanup
+    let _ = std::fs::remove_file(&script_path);
+}
+
+// Test 14: Failed execution through invocation error path
+#[test]
+fn test_failed_execution_error_path() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-failed-exec-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, chunks, errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "partial-fail".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+    };
+
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
+
+    // Should be failure
+    assert!(matches!(result, SubprocessResult::Failure(_)), "Should fail");
+    assert!(registry.is_empty(), "Registry should be empty after failure");
+
+    // Verify partial output was retained
+    let chunks_guard = chunks.lock().unwrap();
+    assert!(!chunks_guard.is_empty(), "Should have partial output chunks");
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("Partial output")), "Should contain partial output");
+
+    // Verify no done chunk was emitted (only on success)
+    assert!(!chunks_guard.iter().any(|(_, _, done)| *done), "Should not have done chunk on failure");
+
+    // Verify error was emitted through error path
+    let errors_guard = errors.lock().unwrap();
+    assert!(!errors_guard.is_empty(), "Should have error emitted");
+}
+
+// Test 15: Atomic cancellation check before PID registration
+#[test]
+fn test_atomic_cancellation_before_registration() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-atomic-cancel-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+    };
+
+    // Create lifecycle and mark it as cancelled before execution
+    let lifecycle = SubprocessLifecycle::new(config);
+    lifecycle.mark_cancelled();
+
+    // Execute should return Cancelled immediately
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
+    assert!(matches!(result, SubprocessResult::Cancelled), "Should be cancelled");
+    assert!(registry.is_empty(), "Registry should be empty");
+
+    // Verify lifecycle is marked as cancelled
+    assert!(lifecycle.is_cancelled(), "Lifecycle should be marked as cancelled");
+}
+
+// Test 16: Cancellation during streaming with atomic check
+#[test]
+fn test_cancellation_during_streaming_atomic() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-cancel-streaming-atomic-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+    };
+
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify process is registered
+    assert!(registry.get(&topic).is_some(), "Process should be registered");
+
+    // Cancel the running process
+    let cancel_result = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result.is_ok(), "Cancellation should succeed");
+
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+
+    // Should be cancelled or failure
+    assert!(matches!(result, SubprocessResult::Cancelled | SubprocessResult::Failure(_)),
+        "Should be cancelled or failure, got: {:?}", result);
+
+    assert!(registry.is_empty(), "Registry should be empty after cancellation");
 }
