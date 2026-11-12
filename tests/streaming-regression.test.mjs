@@ -31,7 +31,9 @@ function executable(code) {
     .replaceAll("catch (e: any)", "catch (e)")
     .replaceAll("catch (ee: any)", "catch (ee)")
     .replaceAll("invoke<string>", "invoke")
-    .replaceAll("listen<{ chunk: string; done: boolean }>", "listen");
+    .replaceAll("invoke<{ running: boolean; endpoint: string; models: string[] }>", "invoke")
+    .replaceAll("listen<{ chunk: string; done: boolean }>", "listen")
+    .replaceAll("(health as any).running", "health.running");
 }
 
 const listenMarker =
@@ -317,5 +319,103 @@ test("Retry passes the selected message while input contains different text", ()
   });
 
   assert.deepEqual(submitted, ["Retry Φπε request"]);
+});
+
+test("refreshModelsAndHealth preserves concurrent settings edits", async () => {
+  // Extract the refreshModelsAndHealth function from App.tsx
+  const refreshStart = position("  async function refreshModelsAndHealth() {");
+  const refreshEnd = position("\n  useEffect(() => { void refreshModelsAndHealth(); }", refreshStart);
+  const refreshCode = executable(source.slice(refreshStart, refreshEnd));
+
+  // Create a deferred promise to control when check_ollama resolves
+  const healthDeferred = deferred();
+
+  // Mock settings with initial values
+  let currentSettings = {
+    ri1CliPath: "/old/path",
+    kosmosPath: "",
+    defaultModel: "old-model",
+    kosmosModel: "old-model",
+    defaultOffline: true,
+    defaultEmitRaw: true,
+    ollamaEndpoint: "http://127.0.0.1:11434",
+  };
+
+  // Mock invoke to return a deferred promise
+  const invokeCalls = [];
+  const mockInvoke = async (name, args) => {
+    invokeCalls.push({ name, args });
+    if (name === "check_ollama") {
+      return healthDeferred.promise;
+    }
+    return null;
+  };
+
+  // Mock setSettings to capture updates
+  const settingsUpdates = [];
+  const mockSetSettings = (updater) => {
+    if (typeof updater === "function") {
+      currentSettings = updater(currentSettings);
+      settingsUpdates.push(currentSettings);
+    } else {
+      currentSettings = updater;
+      settingsUpdates.push(currentSettings);
+    }
+  };
+
+  // Mock other dependencies
+  const mockSetDaemonRunning = () => {};
+  const mockSetAvailableModels = () => {};
+  const mockSetModel = () => {};
+  const mockSetKModel = () => {};
+
+  // Create the function context
+  const env = {
+    settings: currentSettings,
+    invoke: mockInvoke,
+    setDaemonRunning: mockSetDaemonRunning,
+    setAvailableModels: mockSetAvailableModels,
+    setModel: mockSetModel,
+    setKModel: mockSetKModel,
+    setSettings: mockSetSettings,
+    SETTINGS_KEY: "ri1-settings",
+    localStorage: {
+      setItem: (key, value) => {},
+    },
+    model: "old-model",
+    kModel: "old-model",
+  };
+
+  // Start the refresh operation
+  const refreshPromise = vm.runInNewContext(
+    "(async function() { " + refreshCode + "\nreturn refreshModelsAndHealth(); })()",
+    env
+  );
+
+  // Wait a tick to ensure the function has started and captured settings
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Simulate user changing the CLI path while discovery is pending
+  currentSettings = { ...currentSettings, ri1CliPath: "/new/path" };
+
+  // Resolve the health check with models that require repair
+  healthDeferred.resolve({
+    running: true,
+    endpoint: "http://127.0.0.1:11434",
+    models: ["new-model-1", "new-model-2"],
+  });
+
+  // Wait for the refresh to complete
+  await refreshPromise;
+
+  // Assert that the new CLI path survived
+  assert.equal(currentSettings.ri1CliPath, "/new/path", "CLI path should be preserved");
+
+  // Assert that model defaults were repaired
+  assert.equal(currentSettings.defaultModel, "new-model-1", "Default model should be repaired");
+  assert.equal(currentSettings.kosmosModel, "new-model-1", "Kosmos model should be repaired");
+
+  // Assert that settings were updated
+  assert.ok(settingsUpdates.length > 0, "Settings should have been updated");
 });
 

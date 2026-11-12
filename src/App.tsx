@@ -577,9 +577,15 @@ function App() {
 
   // Ollama health check and model list
   async function refreshModelsAndHealth() {
+    const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
     try {
-      const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
       const health = await invoke<{ running: boolean; endpoint: string; models: string[] }>("check_ollama", { endpoint });
+
+      // Ignore response if endpoint has changed during the request
+      if (settings.ollamaEndpoint !== endpoint) {
+        return;
+      }
+
       setDaemonRunning((health as any).running);
       // Always replace availableModels with the returned list, including empty list
       const models = health.models || [];
@@ -594,21 +600,25 @@ function App() {
         setKModel(models[0]);
       }
       // Update settings defaults if they don't match available models
+      // Use functional update to preserve concurrent edits
       if (models.length > 0) {
-        const newSettings = { ...settings };
-        let settingsChanged = false;
-        if (!models.includes(settings.defaultModel)) {
-          newSettings.defaultModel = models[0];
-          settingsChanged = true;
-        }
-        if (!models.includes(settings.kosmosModel)) {
-          newSettings.kosmosModel = models[0];
-          settingsChanged = true;
-        }
-        if (settingsChanged) {
-          setSettings(newSettings);
-          saveSettings(newSettings);
-        }
+        setSettings(prevSettings => {
+          const newSettings = { ...prevSettings };
+          let settingsChanged = false;
+          if (!models.includes(prevSettings.defaultModel)) {
+            newSettings.defaultModel = models[0];
+            settingsChanged = true;
+          }
+          if (!models.includes(prevSettings.kosmosModel)) {
+            newSettings.kosmosModel = models[0];
+            settingsChanged = true;
+          }
+          if (settingsChanged) {
+            // Save to localStorage
+            try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(newSettings)); } catch {}
+          }
+          return newSettings;
+        });
       }
     } catch {
       setDaemonRunning(false);
