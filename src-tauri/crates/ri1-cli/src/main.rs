@@ -10,6 +10,8 @@ use serde_json;
 use uuid::Uuid;
 use std::path::PathBuf;
 use std::fs;
+use reqwest::Client;
+use futures::StreamExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "ri1", version, about = "RI1 Hybrid Generative Engine CLI")]
@@ -67,12 +69,20 @@ fn main() {
         .init();
 
     let cli = Cli::parse();
-    match cli.command {
-        Commands::Gen { modality } => match modality {
-            GenModality::Text { prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint } => {
-                gen_text(prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint)
-            }
-        },
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let result = rt.block_on(async {
+        match cli.command {
+            Commands::Gen { modality } => match modality {
+                GenModality::Text { prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint } => {
+                    gen_text(prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint).await
+                }
+            },
+        }
+    });
+    
+    if let Err(e) = result {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
     }
 }
 
@@ -87,7 +97,13 @@ struct LogEnvelope {
     influence: InfluenceSnapshot,
 }
 
-fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid: Option<String>, log_file: Option<PathBuf>, stream: bool, ollama_model: Option<String>, ollama_endpoint: Option<String>) {
+async fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid: Option<String>, log_file: Option<PathBuf>, stream: bool, ollama_model: Option<String>, ollama_endpoint: Option<String>) -> Result<(), String> {
+    // If Ollama parameters are provided, use Ollama for generation
+    if let (Some(model), Some(endpoint)) = (ollama_model, ollama_endpoint) {
+        return gen_text_ollama(&prompt, &model, &endpoint, stream, verbose).await;
+    }
+
+    // Fallback to BasicText if no Ollama parameters
     let mut orch = Orchestrator::new();
     orch.register_modality(BasicText);
     orch.set_meta_engine(MetaEngineImpl::new_default());
@@ -163,8 +179,86 @@ fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid
                 println!("{} [{}]: {}", r.name, r.severity, r.message.unwrap_or_else(|| "ok".into()));
             }
         }
+        Ok(())
     } else {
         warn!("generation failed or blocked by constraints");
-        eprintln!("error: generation failed or blocked by constraints");
+        Err("generation failed or blocked by constraints".to_string())
     }
+}
+
+async fn gen_text_ollama(prompt: &str, model: &str, endpoint: &str, stream: bool, _verbose: bool) -> Result<(), String> {
+    let client = Client::new();
+    let url = format!("{}/api/generate", endpoint);
+    
+    let request_body = serde_json::json!({
+        "model": model,
+        "prompt": prompt,
+        "stream": stream
+    });
+
+    info!("Sending request to Ollama: {} model: {}", url, model);
+    
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| format!("Failed to send request to Ollama: {}", e))?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("Ollama request failed with status {}: {}", status, body));
+    }
+
+    if stream {
+        // Handle streaming response
+        let mut stream = response.bytes_stream();
+        let mut buffer = String::new();
+        
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| format!("Error reading stream: {}", e))?;
+            let text = String::from_utf8_lossy(&chunk);
+            buffer.push_str(&text);
+            
+            // Process complete lines
+            while let Some(pos) = buffer.find('\n') {
+                let line = buffer[..pos].trim().to_string();
+                buffer = buffer[pos + 1..].to_string();
+                
+                if !line.is_empty() {
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                        if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
+                            print!("{}", response_text);
+                            std::io::Write::flush(&mut std::io::stdout()).ok();
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Process any remaining buffer
+        if !buffer.trim().is_empty() {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&buffer) {
+                if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
+                    print!("{}", response_text);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+            }
+        }
+    } else {
+        // Handle non-streaming response
+        let body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
+            if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
+                println!("{}", response_text);
+            } else {
+                return Err("Invalid response format from Ollama".to_string());
+            }
+        } else {
+            return Err("Failed to parse Ollama response as JSON".to_string());
+        }
+    }
+
+    Ok(())
 }
