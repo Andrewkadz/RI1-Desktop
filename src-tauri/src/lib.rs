@@ -1214,7 +1214,11 @@ async fn gen_ri1_stream(
         }
 
         if let Some(h) = stderr_handle_opt { let _ = h.join(); }
-        let status = child.wait().map_err(|e| format!("wait error: {}", e))?;
+        let status = child.wait().map_err(|e| {
+            // Cleanup registry on wait failure
+            registry.remove(&topic);
+            format!("wait error: {}", e)
+        })?;
         let _ = app.emit(&topic, Ri1Chunk { chunk: "", done: true });
         registry.remove(&topic);
         if status.success() { Ok(()) } else { Err(format!("ri1-cli exited with status: {}", status)) }

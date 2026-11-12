@@ -302,6 +302,7 @@ function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pdfCancelRef = useRef<boolean>(false);
+  const activeRequestId = useRef<string | null>(null);
   const STORAGE_KEY = "ri1.chat.history.v1"; // legacy single history key (migration only)
   const [settings, setSettings] = useState<Settings>({
     ri1CliPath: "",
@@ -1016,6 +1017,9 @@ function App() {
   }
 
   async function stopGeneration() {
+    // Invalidate the active request immediately
+    activeRequestId.current = null;
+
     try {
       if (currentStream) {
         await invoke("cancel_stream", { streamId: currentStream.id, backend: currentStream.backend });
@@ -1057,6 +1061,10 @@ function App() {
 
     // Use overrideText if provided (from retry), otherwise use current prompt state
     const textToSend = overrideText ?? prompt;
+
+    // Set active request ID for this submission
+    const requestId = mkStreamId();
+    activeRequestId.current = requestId;
 
     // Smart greeting detection - only intercept pure greetings, everything else goes to the model
     const trimmedPrompt = textToSend.trim().toLowerCase();
@@ -1122,11 +1130,11 @@ function App() {
     // Smart prioritization: rank by relevance to current prompt
     const MAX_PDF_BLOCKS = 8;
     const sortedPdfPhi = pdfPhi
-      .map(b => ({ block: b, score: calculateRelevanceScore(b, prompt) }))
+      .map(b => ({ block: b, score: calculateRelevanceScore(b, textToSend) }))
       .sort((a, b) => b.score - a.score)
       .map(x => x.block);
     const sortedPdfDelta = pdfDelta
-      .map(b => ({ block: b, score: calculateRelevanceScore(b, prompt) }))
+      .map(b => ({ block: b, score: calculateRelevanceScore(b, textToSend) }))
       .sort((a, b) => b.score - a.score)
       .map(x => x.block);
     const selectedPdfPhi: typeof pdfPhi = [];
@@ -1204,6 +1212,10 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     if (useBasin && textToSend.trim()) {
       try {
         const r = await invoke<{ hits: BasinHit[]; dir: string; curated: number; raw: number }>("basin_search", { query: textToSend, k: 6 });
+        // Check if request was cancelled during context retrieval
+        if (activeRequestId.current !== requestId) {
+          return; // Abort - request was cancelled
+        }
         basinUsed = r.hits;
         setBasinNote(r.hits.length ? "" : `No Basin passage matched this message (searched ${r.curated} curated + ${r.raw} raw passages in ${r.dir}).`);
         if (r.hits.length) {
@@ -1220,6 +1232,11 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
       setBasinNote("");
     }
     setBasinHits(basinUsed);
+
+    // Check if request was cancelled before proceeding
+    if (activeRequestId.current !== requestId) {
+      return; // Abort - request was cancelled
+    }
 
     const prefix = sections.length ? sections.join("\n\n") + "\n\n" : "";
     // No "User:" label: the chat API already marks this as the user's turn, and a
@@ -1243,9 +1260,9 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     try {
       // Listen for stream chunks
       unlistenRef.current = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
-        // Verify this event belongs to the active stream
-        if (currentStream?.id !== streamId) {
-          return; // Ignore events from cancelled/old streams
+        // Verify this event belongs to the active request
+        if (activeRequestId.current !== requestId) {
+          return; // Ignore events from cancelled/old requests
         }
 
         const { chunk, done } = e.payload as any;
@@ -1276,8 +1293,8 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
           updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + chunk } : m)));
         }
         if (done) {
-          // Only process completion if this is still the active stream
-          if (currentStream?.id === streamId) {
+          // Only process completion if this is still the active request
+          if (activeRequestId.current === requestId) {
             setLoading(false);
             if (unlistenRef.current) {
               unlistenRef.current();
@@ -1285,6 +1302,7 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
             }
             setCurrentStream(null);
             setPrompt("");
+            activeRequestId.current = null; // Clear request ID on completion
             void ingestProtocolIfPresent(assistantText);
             // Auto-extract protocol expressions from response
             if (useRi1 && assistantText) {
@@ -1298,6 +1316,10 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
           }
         }
       });
+      // Check if request was cancelled before invoking backend
+      if (activeRequestId.current !== requestId) {
+        return; // Abort - request was cancelled during listener setup
+      }
       // Kick off streaming on backend
       if (useRi1) {
         // Ensure ri1-8b is used with RI1 for symbolic operations
@@ -1308,6 +1330,18 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
         await invoke("gen_ollama_stream", { prompt: fullPrompt, model, streamId });
       }
     } catch (e: any) {
+      // Check if request was cancelled - don't trigger fallback
+      if (activeRequestId.current !== requestId) {
+        // Request was cancelled, just cleanup and return
+        if (unlistenRef.current) {
+          unlistenRef.current();
+          unlistenRef.current = null;
+        }
+        setCurrentStream(null);
+        setLoading(false);
+        return;
+      }
+
       // Fallback to non-streaming for Ollama only
       // RI1 has no non-streaming fallback, so just show error
       if (!useRi1) {
@@ -1326,6 +1360,7 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
           }
           setCurrentStream(null);
           setPrompt("");
+          activeRequestId.current = null;
         }
       } else {
         // RI1 streaming failed - show error without fallback
@@ -1337,6 +1372,7 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
         }
         setCurrentStream(null);
         setPrompt("");
+        activeRequestId.current = null;
       }
     }
   }
