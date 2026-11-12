@@ -1018,7 +1018,7 @@ function App() {
   async function stopGeneration() {
     try {
       if (currentStream) {
-        await invoke("cancel_stream", { stream_id: currentStream.id, backend: currentStream.backend });
+        await invoke("cancel_stream", { streamId: currentStream.id, backend: currentStream.backend });
       }
     } catch {}
     // Clear stream state on cancellation
@@ -1040,12 +1040,8 @@ function App() {
   function retryLast() {
     const last = lastUserMessage();
     if (!last) return;
-    // Set prompt and immediately send - React state updates are batched
-    setPrompt(last.text);
-    // Use requestAnimationFrame to ensure state is updated before send
-    requestAnimationFrame(() => {
-      void send();
-    });
+    // Pass text directly to send without relying on state updates
+    void send(last.text);
   }
 
   function editAndResend() {
@@ -1056,11 +1052,14 @@ function App() {
     requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(last.text.length, last.text.length); });
   }
 
-  async function send() {
+  async function send(overrideText?: string) {
     if (!activeThread) return; // Safety check
-    
+
+    // Use overrideText if provided (from retry), otherwise use current prompt state
+    const textToSend = overrideText ?? prompt;
+
     // Smart greeting detection - only intercept pure greetings, everything else goes to the model
-    const trimmedPrompt = prompt.trim().toLowerCase();
+    const trimmedPrompt = textToSend.trim().toLowerCase();
     const bare = trimmedPrompt.replace(/[!?.]+$/g, "");
 
     const greetings = ["hello", "hi", "hey", "howdy", "greetings", "sup", "yo", "hiya"];    
@@ -1085,7 +1084,7 @@ function App() {
       const assistantId = mkStreamId();
 
       // Add user message and AI local response
-      const userMsg: Msg = { id: userId, role: "user", text: prompt };
+      const userMsg: Msg = { id: userId, role: "user", text: textToSend };
       const aiMsg: Msg = { id: assistantId, role: "assistant", text: localReply };
       
       const updatedThread: Thread = {
@@ -1202,9 +1201,9 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     }
     // RI1 Basin: look up passages from Andrew's documents and hand them to the model with citations
     let basinUsed: BasinHit[] = [];
-    if (useBasin && prompt.trim()) {
+    if (useBasin && textToSend.trim()) {
       try {
-        const r = await invoke<{ hits: BasinHit[]; dir: string; curated: number; raw: number }>("basin_search", { query: prompt, k: 6 });
+        const r = await invoke<{ hits: BasinHit[]; dir: string; curated: number; raw: number }>("basin_search", { query: textToSend, k: 6 });
         basinUsed = r.hits;
         setBasinNote(r.hits.length ? "" : `No Basin passage matched this message (searched ${r.curated} curated + ${r.raw} raw passages in ${r.dir}).`);
         if (r.hits.length) {
@@ -1225,7 +1224,7 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     const prefix = sections.length ? sections.join("\n\n") + "\n\n" : "";
     // No "User:" label: the chat API already marks this as the user's turn, and a
     // transcript-style label invites the model to keep writing both sides.
-    const fullPrompt = `${ri1ProtocolInstruction}${prefix}${prefix || ri1ProtocolInstruction ? "Request:\n" : ""}${prompt}`;
+    const fullPrompt = `${ri1ProtocolInstruction}${prefix}${prefix || ri1ProtocolInstruction ? "Request:\n" : ""}${textToSend}`;
 
     // Bump attention for any blocks used in this send
     if (activeContextBlocks.length) {
@@ -1238,12 +1237,17 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
       }));
     }
     // Add user message (store raw text + full assembled prompt)
-    updateActiveThreadMessages((prev) => [...prev, { id: userId, role: "user", text: prompt, fullPrompt }]);
+    updateActiveThreadMessages((prev) => [...prev, { id: userId, role: "user", text: textToSend, fullPrompt }]);
     // Add empty assistant message placeholder with model tracking
     updateActiveThreadMessages((prev) => [...prev, { id: assistantId, role: "assistant", text: "", model, backend: useRi1 ? "ri1" : "ollama" }]);
     try {
       // Listen for stream chunks
       unlistenRef.current = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
+        // Verify this event belongs to the active stream
+        if (currentStream?.id !== streamId) {
+          return; // Ignore events from cancelled/old streams
+        }
+
         const { chunk, done } = e.payload as any;
         if (chunk) {
           // Filter out RI1 metadata and stderr
@@ -1251,9 +1255,9 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
             setLogs((prev) => prev ? prev + "\n" + chunk : chunk);
             return; // Don't add to message
           }
-          
+
           // Filter out RI1 internal metadata
-          if (chunk.startsWith('---') || 
+          if (chunk.startsWith('---') ||
               chunk.startsWith('{') && chunk.includes('"correlation_id"') ||
               chunk.includes('--- constraints ---') ||
               chunk.includes('InteractionNotice:') ||
@@ -1266,28 +1270,31 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
               chunk.trim().startsWith('max_length')) {
             return; // Skip metadata
           }
-          
+
           // Add actual content
           assistantText += chunk;
           updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + chunk } : m)));
         }
         if (done) {
-          setLoading(false);
-          if (unlistenRef.current) {
-            unlistenRef.current();
-            unlistenRef.current = null;
-          }
-          setCurrentStream(null);
-          setPrompt("");
-          void ingestProtocolIfPresent(assistantText);
-          // Auto-extract protocol expressions from response
-          if (useRi1 && assistantText) {
-            extractProtocolsFromText(assistantText, activeThreadId);
-            updateKnowledgeGraph(assistantText, activeThreadId);
-          }
-          // Auto-TTS if enabled
-          if (ttsEnabled && assistantText) {
-            speakText(assistantText, assistantId);
+          // Only process completion if this is still the active stream
+          if (currentStream?.id === streamId) {
+            setLoading(false);
+            if (unlistenRef.current) {
+              unlistenRef.current();
+              unlistenRef.current = null;
+            }
+            setCurrentStream(null);
+            setPrompt("");
+            void ingestProtocolIfPresent(assistantText);
+            // Auto-extract protocol expressions from response
+            if (useRi1 && assistantText) {
+              extractProtocolsFromText(assistantText, activeThreadId);
+              updateKnowledgeGraph(assistantText, activeThreadId);
+            }
+            // Auto-TTS if enabled
+            if (ttsEnabled && assistantText) {
+              speakText(assistantText, assistantId);
+            }
           }
         }
       });
