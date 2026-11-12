@@ -49,6 +49,15 @@ enum GenModality {
         /// Write a JSON envelope (with cid, content, constraints, events) to file
         #[arg(long)]
         log_file: Option<PathBuf>,
+        /// Stream output line by line
+        #[arg(long, default_value_t = false)]
+        stream: bool,
+        /// Ollama model to use
+        #[arg(long)]
+        ollama_model: Option<String>,
+        /// Ollama endpoint URL
+        #[arg(long)]
+        ollama_endpoint: Option<String>,
     },
 }
 
@@ -60,7 +69,9 @@ fn main() {
     let cli = Cli::parse();
     match cli.command {
         Commands::Gen { modality } => match modality {
-            GenModality::Text { prompt, verbose, json, influence, cid, log_file } => gen_text(prompt, verbose, json, influence, cid, log_file),
+            GenModality::Text { prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint } => {
+                gen_text(prompt, verbose, json, influence, cid, log_file, stream, ollama_model, ollama_endpoint)
+            }
         },
     }
 }
@@ -76,7 +87,7 @@ struct LogEnvelope {
     influence: InfluenceSnapshot,
 }
 
-fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid: Option<String>, log_file: Option<PathBuf>) {
+fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid: Option<String>, log_file: Option<PathBuf>, stream: bool, ollama_model: Option<String>, ollama_endpoint: Option<String>) {
     let mut orch = Orchestrator::new();
     orch.register_modality(BasicText);
     orch.set_meta_engine(MetaEngineImpl::new_default());
@@ -84,7 +95,15 @@ fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid
     info!("modalities = {:?}", orch.modalities());
     let req = GenerationRequest { prompt };
     if let Some(res) = orch.generate("text", req) {
-        println!("{}", res.content);
+        if stream {
+            // Stream output line by line
+            for line in res.content.lines() {
+                println!("{}", line);
+                std::io::Write::flush(&mut std::io::stdout()).ok();
+            }
+        } else {
+            println!("{}", res.content);
+        }
         let (log, mut events) = orch.evaluate_with_events("text", &res.content);
         // Correlation ID event injection
         let cid_val = cid.unwrap_or_else(|| Uuid::new_v4().to_string());

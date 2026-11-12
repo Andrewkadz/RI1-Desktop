@@ -1,3 +1,14 @@
+[workspace]
+members = ["crates/ri1-audio", "crates/ri1-cli", "crates/ri1-code",
+    "crates/ri1-core", "crates/ri1-image", "crates/ri1-signal", "crates/ri1-symbolic", "crates/ri1-symbolic-meta", "crates/ri1-text",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+authors = ["RI1 Contributors"]
+license = "Apache-2.0"
+
 [package]
 name = "ri1-desktop"
 version = "0.1.0"
