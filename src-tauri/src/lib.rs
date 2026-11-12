@@ -1067,9 +1067,9 @@ impl StreamCallback for TauriStreamCallback {
     }
 
     fn emit_error(&self, topic: &str, error: &str) {
-        // For errors, we emit a chunk with done=true and the error message
-        // The frontend will handle this as an error
-        let _ = self.app.emit(topic, Ri1Chunk { chunk: error, done: true });
+        // For errors, emit a chunk with done=false and the error message
+        // The frontend will handle this as an error, not a successful completion
+        let _ = self.app.emit(topic, Ri1Chunk { chunk: error, done: false });
     }
 }
 

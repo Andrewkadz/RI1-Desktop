@@ -9,8 +9,15 @@ use std::thread;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// Process registry for tracking running subprocesses by stream key
+/// Now includes cancellation tokens for atomic cancellation before PID registration
 #[derive(Clone)]
-pub struct ProcessRegistry(Arc<Mutex<HashMap<String, u32>>>);
+pub struct ProcessRegistry(Arc<Mutex<HashMap<String, ProcessEntry>>>);
+
+#[derive(Clone)]
+struct ProcessEntry {
+    pid: Option<u32>,
+    cancelled: Arc<AtomicBool>,
+}
 
 impl ProcessRegistry {
     pub fn new() -> Self {
@@ -19,7 +26,24 @@ impl ProcessRegistry {
 
     pub fn insert(&self, key: String, pid: u32) {
         if let Ok(mut m) = self.0.lock() {
-            m.insert(key, pid);
+            // Get or create entry with cancellation token
+            let entry = m.entry(key).or_insert_with(|| ProcessEntry {
+                pid: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            });
+            entry.pid = Some(pid);
+        }
+    }
+
+    pub fn insert_pending(&self, key: String) -> Arc<AtomicBool> {
+        if let Ok(mut m) = self.0.lock() {
+            let entry = m.entry(key).or_insert_with(|| ProcessEntry {
+                pid: None,
+                cancelled: Arc::new(AtomicBool::new(false)),
+            });
+            entry.cancelled.clone()
+        } else {
+            Arc::new(AtomicBool::new(false))
         }
     }
 
@@ -30,7 +54,27 @@ impl ProcessRegistry {
     }
 
     pub fn get(&self, key: &str) -> Option<u32> {
-        self.0.lock().ok().and_then(|m| m.get(key).copied())
+        self.0.lock().ok().and_then(|m| m.get(key).and_then(|e| e.pid))
+    }
+
+    pub fn get_cancel_token(&self, key: &str) -> Option<Arc<AtomicBool>> {
+        self.0.lock().ok().and_then(|m| m.get(key).map(|e| e.cancelled.clone()))
+    }
+
+    pub fn mark_cancelled(&self, key: &str) -> bool {
+        if let Ok(mut m) = self.0.lock() {
+            if let Some(entry) = m.get_mut(key) {
+                entry.cancelled.store(true, Ordering::SeqCst);
+                return true;
+            }
+        }
+        false
+    }
+
+    pub fn is_cancelled(&self, key: &str) -> bool {
+        self.0.lock().ok().and_then(|m| {
+            m.get(key).map(|e| e.cancelled.load(Ordering::SeqCst))
+        }).unwrap_or(false)
     }
 
     pub fn len(&self) -> usize {
@@ -109,9 +153,11 @@ pub struct SubprocessLifecycle {
 
 impl SubprocessLifecycle {
     pub fn new(config: SubprocessConfig) -> Self {
+        // Get or create cancellation token from registry
+        let cancelled = config.registry.insert_pending(config.topic.clone());
         SubprocessLifecycle {
             config,
-            cancelled: Arc::new(AtomicBool::new(false)),
+            cancelled,
         }
     }
 
@@ -120,6 +166,12 @@ impl SubprocessLifecycle {
     pub fn execute(&self) -> Result<SubprocessResult, String> {
         let topic = &self.config.topic;
         let registry = &self.config.registry;
+
+        // Check if already cancelled before spawning
+        if self.cancelled.load(Ordering::SeqCst) {
+            registry.remove(topic);
+            return Ok(SubprocessResult::Cancelled);
+        }
 
         // Spawn the subprocess
         let mut child = match self.spawn_child() {
@@ -135,7 +187,7 @@ impl SubprocessLifecycle {
         let pid = child.id();
         registry.insert(topic.clone(), pid);
 
-        // Atomic check: if cancelled before registration, kill immediately
+        // Atomic check: if cancelled before or during registration, kill immediately
         if self.cancelled.load(Ordering::SeqCst) || registry.get(topic).is_none() {
             // Process was cancelled before or during registration
             let _ = child.kill();
@@ -162,6 +214,8 @@ impl SubprocessLifecycle {
         let status = match status_result {
             Ok(s) => s,
             Err(e) => {
+                // Ensure child is cleaned up on wait error
+                self.cleanup_child(&mut child);
                 // Emit error through callback for frontend error UI
                 self.config.callback.emit_error(topic, &e);
                 return Err(e);
@@ -283,11 +337,20 @@ impl SubprocessLifecycle {
     pub fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::SeqCst)
     }
+
+    /// Ensure child is terminated and reaped on error paths
+    fn cleanup_child(&self, child: &mut Child) {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
 }
 
 /// Cancellation function for subprocesses
-/// This now also marks any associated lifecycle as cancelled
+/// This marks the cancellation token and kills the process if PID is available
 pub fn cancel_subprocess(registry: &ProcessRegistry, topic: &str) -> Result<(), String> {
+    // Mark as cancelled first (works even before PID registration)
+    let marked = registry.mark_cancelled(topic);
+
     if let Some(pid) = registry.get(topic) {
         // Try SIGTERM then SIGKILL
         let _ = Command::new("kill")
@@ -299,6 +362,10 @@ pub fn cancel_subprocess(registry: &ProcessRegistry, topic: &str) -> Result<(), 
             .arg(format!("{}", pid))
             .status();
         registry.remove(topic);
+        Ok(())
+    } else if marked {
+        // Process was marked as cancelled but PID not yet registered
+        // This is expected for early cancellation
         Ok(())
     } else {
         Err("No running process for stream".to_string())

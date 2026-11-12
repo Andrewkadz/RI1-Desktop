@@ -2,6 +2,7 @@
 // These tests exercise the actual production code from the subprocess module
 
 use std::path::PathBuf;
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use ri1_desktop_lib::subprocess::{
@@ -352,7 +353,7 @@ fn test_wait_error_production() {
 
     let config = SubprocessConfig {
         command: get_mock_cli_path().to_string_lossy().to_string(),
-        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
         topic: topic.clone(),
         registry: registry.clone(),
         callback,
@@ -362,8 +363,19 @@ fn test_wait_error_production() {
         simulate_wait_error: true, // Simulate wait error through production path
     };
 
+    // Spawn lifecycle in a thread to allow PID registration
     let lifecycle = SubprocessLifecycle::new(config);
-    let result = lifecycle.execute();
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Get the PID before wait error occurs
+    let pid_before = registry.get(&topic);
+    assert!(pid_before.is_some(), "Process should be registered before wait error");
+
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed");
 
     // Should return error due to simulated wait error
     assert!(result.is_err(), "Should fail with wait error");
@@ -371,6 +383,20 @@ fn test_wait_error_production() {
 
     // Registry should be cleaned up
     assert!(registry.is_empty(), "Registry should be empty after wait error");
+
+    // Verify child was reaped (no zombie process)
+    // We can check this by trying to get the PID again - it should not exist
+    if let Some(pid) = pid_before {
+        // Try to check if process still exists
+        let check = Command::new("ps")
+            .arg("-p")
+            .arg(format!("{}", pid))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        // Process should not exist (was reaped)
+        assert!(check.is_err() || !check.unwrap().success(), "Child process should be reaped");
+    }
 
     // Error should be emitted through callback
     let errors_guard = errors.lock().unwrap();
@@ -535,9 +561,9 @@ fn test_cancellation_before_registration_production() {
 
     // Cancel immediately (before lifecycle can register)
     // This simulates cancellation arriving before PID registration
+    // With the new cancellation token system, this should succeed
     let cancel_result = cancel_subprocess(&registry, &topic);
-    // This will fail because process hasn't registered yet
-    assert!(cancel_result.is_err(), "Cancellation before registration should fail");
+    assert!(cancel_result.is_ok(), "Cancellation before registration should succeed with cancellation token");
 
     // Release the barrier to let lifecycle proceed
     barrier.wait();
@@ -545,17 +571,15 @@ fn test_cancellation_before_registration_production() {
     // Wait for lifecycle to complete
     let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
 
-    // The lifecycle should still complete (it will register and run)
-    // But since we cancelled before registration, the process might still run
-    // This tests the race condition behavior
-    assert!(matches!(result, SubprocessResult::Success | SubprocessResult::Failure(_) | SubprocessResult::Cancelled),
-        "Should complete with some result");
+    // The lifecycle should return Cancelled because the cancellation token was set
+    assert!(matches!(result, SubprocessResult::Cancelled),
+        "Should be cancelled due to early cancellation token, got: {:?}", result);
 
     // Registry should be cleaned up
     assert!(registry.is_empty(), "Registry should be empty");
 }
 
-// Test 13: Concurrent stdout/stderr draining with large stderr burst
+// Test 13: Concurrent stdout/stderr draining with large stderr burst (2 MiB)
 #[test]
 fn test_concurrent_drain_large_stderr_burst() {
     let registry = ProcessRegistry::new();
@@ -564,12 +588,14 @@ fn test_concurrent_drain_large_stderr_burst() {
 
     let (callback, chunks, _errors) = create_test_callback();
 
-    // Create a test script that writes large stderr burst before stdout
+    // Create a test script that writes 2 MiB of stderr before stdout
+    // This tests that concurrent draining prevents buffer deadlock
     let test_script = r#"
 #!/bin/bash
-# Write large stderr burst first
-for i in {1..100}; do
-    echo "stderr line $i" >&2
+# Write 2 MiB of stderr first (approximately 2 million bytes)
+# Each line is about 100 bytes, so we need about 20000 lines
+for i in {1..20000}; do
+    echo "stderr line $i: This is a test line with some padding to make it longer and fill the buffer faster" >&2
 done
 # Then write stdout
 for i in {1..10}; do
@@ -601,12 +627,29 @@ exit 0
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
-    let start = std::time::Instant::now();
-    let result = lifecycle.execute().expect("Lifecycle execution failed");
-    let elapsed = start.elapsed();
 
-    // Should complete within bounded timeout (5 seconds)
-    assert!(elapsed.as_secs() < 5, "Should complete within 5 seconds, took {:?}", elapsed);
+    // Clone registry for watchdog
+    let registry_clone = registry.clone();
+    let topic_clone = topic.clone();
+
+    // Spawn lifecycle in a thread with watchdog
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Watchdog: fail test if not complete within 10 seconds
+    let _watchdog = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_secs(10));
+        // If we get here, the test timed out
+        // Try to kill the process
+        if let Some(pid) = registry_clone.get(&topic_clone) {
+            let _ = Command::new("kill").arg("-KILL").arg(format!("{}", pid)).status();
+        }
+        panic!("Test timed out after 10 seconds - possible buffer deadlock");
+    });
+
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+
+    // Should succeed
     assert!(matches!(result, SubprocessResult::Success), "Should succeed");
     assert!(registry.is_empty(), "Registry should be empty");
 
@@ -614,6 +657,10 @@ exit 0
     let chunks_guard = chunks.lock().unwrap();
     assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("stdout line")), "Should have stdout chunks");
     assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("[err] stderr line")), "Should have stderr chunks");
+
+    // Verify we got a significant amount of stderr (at least 1000 lines)
+    let stderr_count = chunks_guard.iter().filter(|(_, chunk, _)| chunk.contains("[err] stderr line")).count();
+    assert!(stderr_count > 1000, "Should have many stderr chunks, got {}", stderr_count);
 
     // Cleanup
     let _ = std::fs::remove_file(&script_path);
