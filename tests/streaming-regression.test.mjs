@@ -58,10 +58,12 @@ const retryCode = source.slice(retryStart, retryEnd);
 
 function deferred() {
   let resolve;
-  const promise = new Promise(accept => {
+  let reject;
+  const promise = new Promise((accept, rejectPromise) => {
     resolve = accept;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function createHarness(useRi1 = false) {
@@ -324,7 +326,7 @@ test("Retry passes the selected message while input contains different text", ()
 test("refreshModelsAndHealth preserves concurrent settings edits", async () => {
   // Extract the refreshModelsAndHealth function from App.tsx
   const refreshStart = position("  async function refreshModelsAndHealth() {");
-  const refreshEnd = position("\n  useEffect(() => { void refreshModelsAndHealth(); }", refreshStart);
+  const refreshEnd = position("\n  useEffect(() => {\n    // Invalidate any pending refresh when endpoint changes", refreshStart);
   const refreshCode = executable(source.slice(refreshStart, refreshEnd));
 
   // Create a deferred promise to control when check_ollama resolves
@@ -369,6 +371,10 @@ test("refreshModelsAndHealth preserves concurrent settings edits", async () => {
   const mockSetModel = () => {};
   const mockSetKModel = () => {};
 
+  // Mock refs
+  const refreshRequestId = { current: null };
+  const refreshEndpoint = { current: null };
+
   // Create the function context
   const env = {
     settings: currentSettings,
@@ -384,6 +390,8 @@ test("refreshModelsAndHealth preserves concurrent settings edits", async () => {
     },
     model: "old-model",
     kModel: "old-model",
+    refreshRequestId,
+    refreshEndpoint,
   };
 
   // Start the refresh operation
@@ -417,5 +425,243 @@ test("refreshModelsAndHealth preserves concurrent settings edits", async () => {
 
   // Assert that settings were updated
   assert.ok(settingsUpdates.length > 0, "Settings should have been updated");
+});
+
+test("refreshModelsAndHealth ignores obsolete endpoint responses", async () => {
+  // Extract the refreshModelsAndHealth function from App.tsx
+  const refreshStart = position("  async function refreshModelsAndHealth() {");
+  const refreshEnd = position("\n  useEffect(() => {\n    // Invalidate any pending refresh when endpoint changes", refreshStart);
+  const refreshCode = executable(source.slice(refreshStart, refreshEnd));
+
+  // Create deferred promises for two requests
+  const healthDeferredA = deferred();
+  const healthDeferredB = deferred();
+
+  // Mock settings with initial values
+  let currentSettings = {
+    ri1CliPath: "/old/path",
+    kosmosPath: "",
+    defaultModel: "old-model",
+    kosmosModel: "old-model",
+    defaultOffline: true,
+    defaultEmitRaw: true,
+    ollamaEndpoint: "http://127.0.0.1:11434",
+  };
+
+  // Mock invoke to return different deferred promises based on endpoint
+  const invokeCalls = [];
+  const mockInvoke = async (name, args) => {
+    invokeCalls.push({ name, args });
+    if (name === "check_ollama") {
+      if (args.endpoint === "http://127.0.0.1:11434") {
+        return healthDeferredA.promise;
+      } else if (args.endpoint === "http://127.0.0.1:11435") {
+        return healthDeferredB.promise;
+      }
+    }
+    return null;
+  };
+
+  // Mock setSettings to capture updates
+  const settingsUpdates = [];
+  const mockSetSettings = (updater) => {
+    if (typeof updater === "function") {
+      currentSettings = updater(currentSettings);
+      settingsUpdates.push(currentSettings);
+    } else {
+      currentSettings = updater;
+      settingsUpdates.push(currentSettings);
+    }
+  };
+
+  // Mock other dependencies
+  const mockSetDaemonRunning = () => {};
+  const mockSetAvailableModels = () => {};
+  const mockSetModel = () => {};
+  const mockSetKModel = () => {};
+
+  // Mock refs
+  const refreshRequestId = { current: null };
+  const refreshEndpoint = { current: null };
+
+  // Create the function context
+  const env = {
+    settings: currentSettings,
+    invoke: mockInvoke,
+    setDaemonRunning: mockSetDaemonRunning,
+    setAvailableModels: mockSetAvailableModels,
+    setModel: mockSetModel,
+    setKModel: mockSetKModel,
+    setSettings: mockSetSettings,
+    SETTINGS_KEY: "ri1-settings",
+    localStorage: {
+      setItem: (key, value) => {},
+    },
+    model: "old-model",
+    kModel: "old-model",
+    refreshRequestId,
+    refreshEndpoint,
+  };
+
+  // Start request A with endpoint A
+  const refreshPromiseA = vm.runInNewContext(
+    "(async function() { " + refreshCode + "\nreturn refreshModelsAndHealth(); })()",
+    { ...env, settings: { ...currentSettings, ollamaEndpoint: "http://127.0.0.1:11434" } }
+  );
+
+  // Wait a tick to ensure request A has started
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Change endpoint to B and start request B
+  currentSettings = { ...currentSettings, ollamaEndpoint: "http://127.0.0.1:11435" };
+  const refreshPromiseB = vm.runInNewContext(
+    "(async function() { " + refreshCode + "\nreturn refreshModelsAndHealth(); })()",
+    { ...env, settings: currentSettings }
+  );
+
+  // Wait a tick to ensure request B has started
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Resolve request B first (should succeed)
+  healthDeferredB.resolve({
+    running: true,
+    endpoint: "http://127.0.0.1:11435",
+    models: ["model-b-1", "model-b-2"],
+  });
+
+  // Wait for request B to complete
+  await refreshPromiseB;
+
+  // Now resolve request A (should be ignored as obsolete)
+  healthDeferredA.resolve({
+    running: true,
+    endpoint: "http://127.0.0.1:11434",
+    models: ["model-a-1", "model-a-2"],
+  });
+
+  // Wait for request A to complete
+  await refreshPromiseA;
+
+  // Assert that B's models and settings are intact
+  assert.equal(currentSettings.defaultModel, "model-b-1", "Default model should be from request B");
+  assert.equal(currentSettings.kosmosModel, "model-b-1", "Kosmos model should be from request B");
+  assert.equal(currentSettings.ollamaEndpoint, "http://127.0.0.1:11435", "Endpoint should be B");
+});
+
+test("refreshModelsAndHealth ignores obsolete endpoint rejections", async () => {
+  // Extract the refreshModelsAndHealth function from App.tsx
+  const refreshStart = position("  async function refreshModelsAndHealth() {");
+  const refreshEnd = position("\n  useEffect(() => {\n    // Invalidate any pending refresh when endpoint changes", refreshStart);
+  const refreshCode = executable(source.slice(refreshStart, refreshEnd));
+
+  // Create deferred promises for two requests
+  const healthDeferredA = deferred();
+  const healthDeferredB = deferred();
+
+  // Mock settings with initial values
+  let currentSettings = {
+    ri1CliPath: "/old/path",
+    kosmosPath: "",
+    defaultModel: "old-model",
+    kosmosModel: "old-model",
+    defaultOffline: true,
+    defaultEmitRaw: true,
+    ollamaEndpoint: "http://127.0.0.1:11434",
+  };
+
+  // Mock invoke to return different deferred promises based on endpoint
+  const invokeCalls = [];
+  const mockInvoke = async (name, args) => {
+    invokeCalls.push({ name, args });
+    if (name === "check_ollama") {
+      if (args.endpoint === "http://127.0.0.1:11434") {
+        return healthDeferredA.promise;
+      } else if (args.endpoint === "http://127.0.0.1:11435") {
+        return healthDeferredB.promise;
+      }
+    }
+    return null;
+  };
+
+  // Mock setSettings to capture updates
+  const settingsUpdates = [];
+  const mockSetSettings = (updater) => {
+    if (typeof updater === "function") {
+      currentSettings = updater(currentSettings);
+      settingsUpdates.push(currentSettings);
+    } else {
+      currentSettings = updater;
+      settingsUpdates.push(currentSettings);
+    }
+  };
+
+  // Mock other dependencies
+  const mockSetDaemonRunning = () => {};
+  const mockSetAvailableModels = () => {};
+  const mockSetModel = () => {};
+  const mockSetKModel = () => {};
+
+  // Mock refs
+  const refreshRequestId = { current: null };
+  const refreshEndpoint = { current: null };
+
+  // Create the function context
+  const env = {
+    settings: currentSettings,
+    invoke: mockInvoke,
+    setDaemonRunning: mockSetDaemonRunning,
+    setAvailableModels: mockSetAvailableModels,
+    setModel: mockSetModel,
+    setKModel: mockSetKModel,
+    setSettings: mockSetSettings,
+    SETTINGS_KEY: "ri1-settings",
+    localStorage: {
+      setItem: (key, value) => {},
+    },
+    model: "old-model",
+    kModel: "old-model",
+    refreshRequestId,
+    refreshEndpoint,
+  };
+
+  // Start request A with endpoint A
+  const refreshPromiseA = vm.runInNewContext(
+    "(async function() { " + refreshCode + "\nreturn refreshModelsAndHealth(); })()",
+    { ...env, settings: { ...currentSettings, ollamaEndpoint: "http://127.0.0.1:11434" } }
+  );
+
+  // Wait a tick to ensure request A has started
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Change endpoint to B and start request B
+  currentSettings = { ...currentSettings, ollamaEndpoint: "http://127.0.0.1:11435" };
+  const refreshPromiseB = vm.runInNewContext(
+    "(async function() { " + refreshCode + "\nreturn refreshModelsAndHealth(); })()",
+    { ...env, settings: currentSettings }
+  );
+
+  // Wait a tick to ensure request B has started
+  await new Promise(resolve => setTimeout(resolve, 10));
+
+  // Resolve request B first (should succeed)
+  healthDeferredB.resolve({
+    running: true,
+    endpoint: "http://127.0.0.1:11435",
+    models: ["model-b-1", "model-b-2"],
+  });
+
+  // Wait for request B to complete
+  await refreshPromiseB;
+
+  // Now reject request A (should be ignored as obsolete)
+  healthDeferredA.reject(new Error("Request A failed"));
+
+  // Wait for request A to complete
+  await refreshPromiseA;
+
+  // Assert that B's models and settings are intact
+  assert.equal(currentSettings.defaultModel, "model-b-1", "Default model should be from request B");
+  assert.equal(currentSettings.kosmosModel, "model-b-1", "Kosmos model should be from request B");
+  assert.equal(currentSettings.ollamaEndpoint, "http://127.0.0.1:11435", "Endpoint should be B");
 });
 

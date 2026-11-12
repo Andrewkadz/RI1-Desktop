@@ -304,6 +304,8 @@ function App() {
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const pdfCancelRef = useRef<boolean>(false);
   const activeRequestId = useRef<string | null>(null);
+  const refreshRequestId = useRef<string | null>(null);
+  const refreshEndpoint = useRef<string | null>(null);
   const STORAGE_KEY = "ri1.chat.history.v1"; // legacy single history key (migration only)
   const [settings, setSettings] = useState<Settings>({
     ri1CliPath: "",
@@ -578,11 +580,17 @@ function App() {
   // Ollama health check and model list
   async function refreshModelsAndHealth() {
     const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
+    const requestId = Math.random().toString(36).substring(2, 15);
+
+    // Invalidate any previous refresh request
+    refreshRequestId.current = requestId;
+    refreshEndpoint.current = endpoint;
+
     try {
       const health = await invoke<{ running: boolean; endpoint: string; models: string[] }>("check_ollama", { endpoint });
 
-      // Ignore response if endpoint has changed during the request
-      if (settings.ollamaEndpoint !== endpoint) {
+      // Check if this request is still current and endpoint hasn't changed
+      if (refreshRequestId.current !== requestId || refreshEndpoint.current !== endpoint) {
         return;
       }
 
@@ -621,12 +629,20 @@ function App() {
         });
       }
     } catch {
-      setDaemonRunning(false);
-      setAvailableModels([]);
+      // Check if this request is still current before updating error state
+      if (refreshRequestId.current === requestId && refreshEndpoint.current === endpoint) {
+        setDaemonRunning(false);
+        setAvailableModels([]);
+      }
     }
   }
 
-  useEffect(() => { void refreshModelsAndHealth(); }, [settings.ollamaEndpoint]);
+  useEffect(() => {
+    // Invalidate any pending refresh when endpoint changes
+    refreshRequestId.current = null;
+    refreshEndpoint.current = null;
+    void refreshModelsAndHealth();
+  }, [settings.ollamaEndpoint]);
 
   // Thread helpers
   function updateActiveThreadMessages(mutator: (msgs: Msg[]) => Msg[]) {
