@@ -119,6 +119,8 @@ pub struct SubprocessConfig {
     pub stderr_piped: bool,
     /// Optional flag to simulate wait errors for testing
     pub simulate_wait_error: bool,
+    /// Optional cancellation token from registry (for early cancellation)
+    pub cancel_token: Option<Arc<AtomicBool>>,
 }
 
 impl Default for SubprocessConfig {
@@ -133,6 +135,7 @@ impl Default for SubprocessConfig {
             stdout_piped: true,
             stderr_piped: true,
             simulate_wait_error: false,
+            cancel_token: None,
         }
     }
 }
@@ -153,8 +156,9 @@ pub struct SubprocessLifecycle {
 
 impl SubprocessLifecycle {
     pub fn new(config: SubprocessConfig) -> Self {
-        // Get or create cancellation token from registry
-        let cancelled = config.registry.insert_pending(config.topic.clone());
+        // Use provided cancel_token or get/create from registry
+        let cancelled = config.cancel_token.clone()
+            .unwrap_or_else(|| config.registry.insert_pending(config.topic.clone()));
         SubprocessLifecycle {
             config,
             cancelled,

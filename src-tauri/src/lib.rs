@@ -827,20 +827,45 @@ async fn gen_ollama_stream(
     let stream_topic = format!("ollama://{}", stream_id);
     let registry = state.inner().clone();
 
+    // Reserve request in registry at command entry (before async dispatch)
+    let cancel_token = registry.insert_pending(stream_topic.clone());
+
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
-        let mut child = spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true))
-            .map_err(|e| {
+
+        // Check if cancelled before spawning
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&stream_topic);
+            return Ok(());
+        }
+
+        let mut child = match spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true)) {
+            Ok(c) => c,
+            Err(e) => {
                 // Cleanup on spawn failure
                 registry.remove(&stream_topic);
-                e
-            })?;
+                return Err(e);
+            }
+        };
+
+        // Check cancellation again after spawn
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = child.kill();
+            let _ = child.wait();
+            registry.remove(&stream_topic);
+            return Ok(());
+        }
+
         // tracked so the Stop button (cancel_stream) can end the request
         registry.insert(stream_topic.clone(), child.id());
 
         let mut err_msg: Option<String> = None;
         if let Some(stdout) = child.stdout.take() {
             for line in BufReader::new(stdout).lines() {
+                // Check cancellation during streaming
+                if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
                 let line = match line { Ok(l) => l, Err(_) => break };
                 if line.trim().is_empty() { continue; }
                 let v: serde_json::Value = match serde_json::from_str(&line) {
@@ -955,9 +980,19 @@ async fn run_kosmos_stream(
 ) -> Result<(), String> {
     let stream_topic = format!("kosmos://{}", topic);
     let registry = state.inner().clone();
+
+    // Reserve request in registry at command entry (before async dispatch)
+    let cancel_token = registry.insert_pending(stream_topic.clone());
+
     tauri::async_runtime::spawn_blocking(move || {
         use std::env;
         use std::process::{Command, Stdio};
+
+        // Check if cancelled before proceeding with CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&stream_topic);
+            return Ok(());
+        }
 
         fn find_ri1_cli(override_path: Option<String>) -> Option<String> {
             if let Some(p) = override_path {
@@ -1017,14 +1052,33 @@ async fn run_kosmos_stream(
         if emit_raw { args.push("--emit-raw".into()); }
         if let Some(m) = ollama_model { args.push("--ollama-model".into()); args.push(m); }
 
-        let ri1_bin = find_ri1_cli(ri1_cli_path).ok_or_else(|| "could not find 'ri1-cli' in PATH or common locations; set RI1_CLI_PATH to override".to_string())?;
+        // Check cancellation again before CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&stream_topic);
+            return Ok(());
+        }
+
+        let ri1_bin = match find_ri1_cli(ri1_cli_path) {
+            Some(bin) => bin,
+            None => {
+                // Clean up reservation on discovery failure
+                registry.remove(&stream_topic);
+                return Err("could not find 'ri1-cli' in PATH or common locations; set RI1_CLI_PATH to override".to_string());
+            }
+        };
+
+        // Check cancellation again after CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&stream_topic);
+            return Ok(());
+        }
 
         // Create Tauri callback for event emission
         let callback = Arc::new(TauriStreamCallback {
             app: app.clone(),
         });
 
-        // Use shared subprocess lifecycle
+        // Use shared subprocess lifecycle with existing cancellation token
         let config = SubprocessConfig {
             command: ri1_bin,
             args,
@@ -1035,6 +1089,7 @@ async fn run_kosmos_stream(
             stdout_piped: true,
             stderr_piped: true,
             simulate_wait_error: false,
+            cancel_token: Some(cancel_token.clone()),
         };
 
         let lifecycle = SubprocessLifecycle::new(config);
@@ -1067,9 +1122,10 @@ impl StreamCallback for TauriStreamCallback {
     }
 
     fn emit_error(&self, topic: &str, error: &str) {
-        // For errors, emit a chunk with done=false and the error message
+        // For errors, emit a chunk with done=false and the error message prefixed with [err]
         // The frontend will handle this as an error, not a successful completion
-        let _ = self.app.emit(topic, Ri1Chunk { chunk: error, done: false });
+        let error_chunk = format!("[err] {}", error);
+        let _ = self.app.emit(topic, Ri1Chunk { chunk: &error_chunk, done: false });
     }
 }
 
@@ -1088,9 +1144,18 @@ async fn gen_ri1_stream(
     let topic = format!("ri1://{}", stream_id);
     let registry = state.inner().clone();
 
+    // Reserve request in registry at command entry (before async dispatch)
+    let cancel_token = registry.insert_pending(topic.clone());
+
     tauri::async_runtime::spawn_blocking(move || {
         use std::env;
         use std::process::{Command, Stdio};
+
+        // Check if cancelled before proceeding with CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&topic);
+            return Ok(());
+        }
 
         fn find_ri1_cli(override_path: Option<String>) -> Option<String> {
             if let Some(p) = override_path {
@@ -1121,7 +1186,27 @@ async fn gen_ri1_stream(
         }
         let safe_prompt = sanitize(&prompt);
 
-        let ri1_bin = find_ri1_cli(ri1_cli_path).ok_or_else(|| "could not find 'ri1-cli'".to_string())?;
+        // Check cancellation again before CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&topic);
+            return Ok(());
+        }
+
+        let ri1_bin = match find_ri1_cli(ri1_cli_path) {
+            Some(bin) => bin,
+            None => {
+                // Clean up reservation on discovery failure
+                registry.remove(&topic);
+                return Err("could not find 'ri1-cli'".to_string());
+            }
+        };
+
+        // Check cancellation again after CLI discovery
+        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+            registry.remove(&topic);
+            return Ok(());
+        }
+
         let mut args: Vec<String> = vec!["gen".into(), "text".into(), "--prompt".into(), safe_prompt, "--stream".into()];
         if let Some(m) = model {
             let name = m.trim().to_string();
@@ -1139,7 +1224,7 @@ async fn gen_ri1_stream(
             app: app.clone(),
         });
 
-        // Use shared subprocess lifecycle
+        // Use shared subprocess lifecycle with existing cancellation token
         let config = SubprocessConfig {
             command: ri1_bin,
             args,
@@ -1150,6 +1235,7 @@ async fn gen_ri1_stream(
             stdout_piped: true,
             stderr_piped: true,
             simulate_wait_error: false,
+            cancel_token: Some(cancel_token.clone()),
         };
 
         let lifecycle = SubprocessLifecycle::new(config);

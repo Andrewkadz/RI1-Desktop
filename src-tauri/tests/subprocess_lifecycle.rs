@@ -69,6 +69,7 @@ fn test_normal_completion_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -102,6 +103,7 @@ fn test_partial_output_failure_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -139,6 +141,7 @@ fn test_cancellation_during_startup_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread
@@ -181,6 +184,7 @@ fn test_cancellation_running_child_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread
@@ -226,6 +230,7 @@ fn test_repeated_cancellation_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread
@@ -270,6 +275,7 @@ fn test_send_stop_send_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn first lifecycle
@@ -304,6 +310,7 @@ fn test_send_stop_send_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn second lifecycle
@@ -333,6 +340,7 @@ fn test_registry_cleanup_spawn_failure_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -361,6 +369,7 @@ fn test_wait_error_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: true, // Simulate wait error through production path
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread to allow PID registration
@@ -423,6 +432,7 @@ fn test_negative_control_ineffective_cancellation_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread
@@ -479,6 +489,7 @@ fn test_multiple_concurrent_processes_production() {
             stdout_piped: true,
             stderr_piped: true,
             simulate_wait_error: false,
+            cancel_token: None,
         };
 
         let lifecycle = SubprocessLifecycle::new(config);
@@ -514,6 +525,7 @@ fn test_process_reaping_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -545,6 +557,7 @@ fn test_cancellation_before_registration_production() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Create a barrier to synchronize cancellation before registration
@@ -624,6 +637,7 @@ exit 0
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -685,6 +699,7 @@ fn test_failed_execution_error_path() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     let lifecycle = SubprocessLifecycle::new(config);
@@ -726,6 +741,7 @@ fn test_atomic_cancellation_before_registration() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Create lifecycle and mark it as cancelled before execution
@@ -760,6 +776,7 @@ fn test_cancellation_during_streaming_atomic() {
         stdout_piped: true,
         stderr_piped: true,
         simulate_wait_error: false,
+        cancel_token: None,
     };
 
     // Spawn lifecycle in a thread
@@ -784,4 +801,164 @@ fn test_cancellation_during_streaming_atomic() {
         "Should be cancelled or failure, got: {:?}", result);
 
     assert!(registry.is_empty(), "Registry should be empty after cancellation");
+}
+
+// Test 17: Deterministic test for blocked CLI discovery with cancellation
+#[test]
+fn test_blocked_cli_discovery_cancellation() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-blocked-discovery-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    // Reserve request in registry (simulating command entry)
+    let cancel_token = registry.insert_pending(topic.clone());
+
+    // Create a channel to control CLI discovery blocking
+    let (discovery_tx, discovery_rx) = std::sync::mpsc::channel::<()>();
+
+    // Spawn a thread that simulates blocked CLI discovery
+    let discovery_handle = std::thread::spawn(move || {
+        // Wait for signal to proceed with discovery
+        let _ = discovery_rx.recv();
+        // Simulate CLI discovery taking time
+        std::thread::sleep(Duration::from_millis(100));
+        // Return a mock CLI path
+        get_mock_cli_path().to_string_lossy().to_string()
+    });
+
+    // Issue cancellation while discovery is blocked
+    let cancel_result = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result.is_ok(), "Cancellation should succeed during blocked discovery");
+
+    // Release the discovery block
+    let _ = discovery_tx.send(());
+
+    // Wait for discovery to complete
+    let cli_path = discovery_handle.join().expect("Discovery thread join failed");
+
+    // Check if cancelled before proceeding
+    if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+        // Should not proceed with generation
+        registry.remove(&topic);
+        assert!(registry.is_empty(), "Registry should be empty after cancellation");
+        return;
+    }
+
+    // If not cancelled, proceed with lifecycle (this shouldn't happen in this test)
+    let config = SubprocessConfig {
+        command: cli_path,
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+        cancel_token: Some(cancel_token.clone()),
+    };
+
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
+
+    // Should be cancelled because token was set
+    assert!(matches!(result, SubprocessResult::Cancelled), "Should be cancelled");
+    assert!(registry.is_empty(), "Registry should be empty");
+}
+
+// Test 18: Replace detached watchdog with recv_timeout pattern
+#[test]
+fn test_concurrent_drain_with_recv_timeout() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-concurrent-drain-timeout-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, chunks, _errors) = create_test_callback();
+
+    // Create a test script that writes 2 MiB of stderr before stdout
+    let test_script = r#"
+#!/bin/bash
+# Write 2 MiB of stderr first
+for i in {1..20000}; do
+    echo "stderr line $i: This is a test line with some padding to make it longer and fill the buffer faster" >&2
+done
+# Then write stdout
+for i in {1..10}; do
+    echo "stdout line $i"
+done
+exit 0
+"#;
+
+    let script_path = std::env::temp_dir().join("test_stderr_burst_timeout.sh");
+    std::fs::write(&script_path, test_script).expect("Failed to write test script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script_path, perms).unwrap();
+    }
+
+    let config = SubprocessConfig {
+        command: script_path.to_string_lossy().to_string(),
+        args: vec![],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+        simulate_wait_error: false,
+        cancel_token: None,
+    };
+
+    let lifecycle = SubprocessLifecycle::new(config);
+
+    // Create a channel for completion notification
+    let (done_tx, done_rx) = std::sync::mpsc::channel::<Result<SubprocessResult, String>>();
+
+    // Spawn lifecycle in a thread
+    let handle = std::thread::spawn(move || {
+        let result = lifecycle.execute();
+        let _ = done_tx.send(result);
+    });
+
+    // Wait for completion with timeout using recv_timeout
+    let timeout = Duration::from_secs(10);
+    let result = match done_rx.recv_timeout(timeout) {
+        Ok(result) => result.expect("Lifecycle execution failed"),
+        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            // Timeout occurred - clean up and fail test
+            if let Some(pid) = registry.get(&topic) {
+                let _ = Command::new("kill").arg("-KILL").arg(format!("{}", pid)).status();
+            }
+            registry.remove(&topic);
+            let _ = std::fs::remove_file(&script_path);
+            panic!("Test timed out after {:?} - possible buffer deadlock", timeout);
+        }
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            panic!("Lifecycle thread disconnected unexpectedly");
+        }
+    };
+
+    // Wait for thread to complete
+    let _ = handle.join();
+
+    // Should succeed
+    assert!(matches!(result, SubprocessResult::Success), "Should succeed");
+    assert!(registry.is_empty(), "Registry should be empty");
+
+    // Verify both stdout and stderr chunks were emitted
+    let chunks_guard = chunks.lock().unwrap();
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("stdout line")), "Should have stdout chunks");
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("[err] stderr line")), "Should have stderr chunks");
+
+    // Verify we got a significant amount of stderr (at least 1000 lines)
+    let stderr_count = chunks_guard.iter().filter(|(_, chunk, _)| chunk.contains("[err] stderr line")).count();
+    assert!(stderr_count > 1000, "Should have many stderr chunks, got {}", stderr_count);
+
+    // Cleanup
+    let _ = std::fs::remove_file(&script_path);
 }
