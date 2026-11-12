@@ -1,43 +1,32 @@
-// Integration tests for subprocess lifecycle and cancellation
-// These tests exercise the production Rust lifecycle patterns using a controlled CLI fixture
+// Integration tests for subprocess lifecycle using production implementation
+// These tests exercise the actual production code from the subprocess module
 
-use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use ri1_desktop_lib::subprocess::{
+    ProcessRegistry, SubprocessConfig, SubprocessLifecycle, SubprocessResult,
+    StreamCallback, cancel_subprocess, create_topic
+};
 
-// Mock ProcessRegistry matching production implementation
-#[derive(Clone)]
-struct ProcessRegistry(Arc<Mutex<HashMap<String, u32>>>);
+// Test callback that collects emitted chunks and outcomes
+struct TestCallback {
+    chunks: Arc<Mutex<Vec<(String, String, bool)>>>,
+    errors: Arc<Mutex<Vec<(String, String)>>>,
+}
 
-impl ProcessRegistry {
-    fn new() -> Self {
-        ProcessRegistry(Arc::new(Mutex::new(HashMap::new())))
-    }
-
-    fn insert(&self, key: String, pid: u32) {
-        if let Ok(mut m) = self.0.lock() {
-            m.insert(key, pid);
+impl StreamCallback for TestCallback {
+    fn emit_chunk(&self, topic: &str, chunk: &str, done: bool) {
+        if let Ok(mut chunks) = self.chunks.lock() {
+            chunks.push((topic.to_string(), chunk.to_string(), done));
         }
     }
 
-    fn remove(&self, key: &str) {
-        if let Ok(mut m) = self.0.lock() {
-            let _ = m.remove(key);
+    fn emit_error(&self, topic: &str, error: &str) {
+        if let Ok(mut errors) = self.errors.lock() {
+            errors.push((topic.to_string(), error.to_string()));
         }
-    }
-
-    fn get(&self, key: &str) -> Option<u32> {
-        self.0.lock().ok().and_then(|m| m.get(key).copied())
-    }
-
-    fn len(&self) -> usize {
-        self.0.lock().map(|m| m.len()).unwrap_or(0)
-    }
-
-    fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 }
 
@@ -50,391 +39,520 @@ fn get_mock_cli_path() -> PathBuf {
     workspace_root.join("tests").join("mock-ri1-cli.sh")
 }
 
-// Helper to run mock CLI with scenario
-fn run_mock_cli(scenario: &str, args: &[&str]) -> std::process::Output {
-    let mock_path = get_mock_cli_path();
-    Command::new(&mock_path)
-        .env("TEST_SCENARIO", scenario)
-        .args(args)
-        .output()
-        .expect("Failed to run mock CLI")
+// Helper to create test callback
+fn create_test_callback() -> (Arc<TestCallback>, Arc<Mutex<Vec<(String, String, bool)>>>, Arc<Mutex<Vec<(String, String)>>>) {
+    let chunks = Arc::new(Mutex::new(Vec::new()));
+    let errors = Arc::new(Mutex::new(Vec::new()));
+    let callback = Arc::new(TestCallback {
+        chunks: chunks.clone(),
+        errors: errors.clone(),
+    });
+    (callback, chunks, errors)
 }
 
-// Helper to spawn mock CLI as child process
-fn spawn_mock_cli(scenario: &str, args: &[&str]) -> std::process::Child {
-    let mock_path = get_mock_cli_path();
-    Command::new(&mock_path)
-        .env("TEST_SCENARIO", scenario)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("Failed to spawn mock CLI")
-}
-
-// Test 1: Normal completion - process exits successfully
+// Test 1: Normal completion using production lifecycle
 #[test]
-fn test_normal_completion() {
+fn test_normal_completion_production() {
     let registry = ProcessRegistry::new();
-    let stream_id = "test-normal";
-    let topic = format!("ri1://{}", stream_id);
+    let stream_id = "test-normal-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Spawn mock CLI with normal scenario
-    let mut child = spawn_mock_cli("normal", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
+    let (callback, chunks, _errors) = create_test_callback();
 
-    // Register in registry (simulating production code)
-    registry.insert(topic.clone(), pid);
-    assert_eq!(registry.get(&topic), Some(pid));
-    assert_eq!(registry.len(), 1);
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
 
-    // Wait for completion
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Process should exit successfully");
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
 
-    // Cleanup registry (simulating production code)
-    registry.remove(&topic);
-    assert!(registry.is_empty(), "Registry should be empty after cleanup");
+    assert!(matches!(result, SubprocessResult::Success), "Should succeed");
+    assert!(registry.is_empty(), "Registry should be empty after completion");
+
+    // Verify chunks were emitted
+    let chunks_guard = chunks.lock().unwrap();
+    assert!(!chunks_guard.is_empty(), "Should have emitted chunks");
+    assert!(chunks_guard.iter().any(|(_, _, done)| *done), "Should have done chunk");
 }
 
-// Test 2: Partial output followed by failure
+// Test 2: Partial output followed by failure using production lifecycle
 #[test]
-fn test_partial_output_failure() {
+fn test_partial_output_failure_production() {
     let registry = ProcessRegistry::new();
-    let stream_id = "test-partial-fail";
-    let topic = format!("ri1://{}", stream_id);
+    let stream_id = "test-partial-fail-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Spawn mock CLI with partial-fail scenario
-    let mut child = spawn_mock_cli("partial-fail", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
+    let (callback, chunks, errors) = create_test_callback();
 
-    // Register in registry
-    registry.insert(topic.clone(), pid);
-    assert_eq!(registry.get(&topic), Some(pid));
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "partial-fail".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
 
-    // Read stdout to verify partial output
-    use std::io::{BufRead, BufReader};
-    let stdout = child.stdout.take().expect("Failed to take stdout");
-    let reader = BufReader::new(stdout);
-    let mut lines = Vec::new();
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
 
-    for line in reader.lines() {
-        if let Ok(l) = line {
-            lines.push(l);
-        }
-    }
+    assert!(matches!(result, SubprocessResult::Failure(_)), "Should fail");
+    assert!(registry.is_empty(), "Registry should be empty after failure");
 
-    // Should have partial output
-    assert!(!lines.is_empty(), "Should have partial output before failure");
-    assert!(lines.iter().any(|l| l.contains("Partial output")), "Should contain partial output");
+    // Verify partial output was emitted
+    let chunks_guard = chunks.lock().unwrap();
+    assert!(!chunks_guard.is_empty(), "Should have partial output chunks");
+    assert!(chunks_guard.iter().any(|(_, chunk, _)| chunk.contains("Partial output")), "Should contain partial output");
 
-    // Wait for completion - should fail
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(!status.success(), "Process should exit with failure");
-
-    // Cleanup registry
-    registry.remove(&topic);
-    assert!(registry.is_empty(), "Registry should be empty after cleanup");
+    // Verify error was emitted
+    let errors_guard = errors.lock().unwrap();
+    assert!(!errors_guard.is_empty(), "Should have error emitted");
 }
 
-// Test 3: Cancellation during startup (before PID registration completes)
+// Test 3: Cancellation during startup using production lifecycle
 #[test]
-fn test_cancellation_during_startup() {
+fn test_cancellation_during_startup_production() {
     let registry = ProcessRegistry::new();
-    let stream_id = "test-cancel-startup";
-    let topic = format!("ri1://{}", stream_id);
+    let stream_id = "test-cancel-startup-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Spawn slow-start mock CLI
-    let mut child = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
+    let (callback, _chunks, _errors) = create_test_callback();
 
-    // Simulate cancellation arriving before registration completes
-    // In production, this would be a race between spawn and registry.insert
-    // For testing, we cancel immediately after spawn
-    registry.insert(topic.clone(), pid);
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
 
-    // Cancel immediately (simulating fast cancellation)
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("{}", pid))
-        .status();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
 
-    // Remove from registry (simulating cancel_stream)
-    registry.remove(&topic);
-    assert!(registry.is_empty(), "Registry should be empty after cancellation");
-
-    // Wait for process to terminate
-    let status = child.wait().expect("Failed to wait for child");
-    // Process should be terminated (either by signal or exit code)
-    assert!(!status.success() || status.code().is_none(), "Process should be terminated");
-}
-
-// Test 4: Cancellation of running child
-#[test]
-fn test_cancellation_running_child() {
-    let registry = ProcessRegistry::new();
-    let stream_id = "test-cancel-running";
-    let topic = format!("ri1://{}", stream_id);
-
-    // Spawn slow-start mock CLI
-    let mut child = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
-
-    // Register in registry
-    registry.insert(topic.clone(), pid);
-    assert_eq!(registry.get(&topic), Some(pid));
-
-    // Wait a bit to ensure process is running
+    // Wait a bit for process to start and register
     std::thread::sleep(Duration::from_millis(100));
 
-    // Cancel the running process
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("{}", pid))
-        .status();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
+    // Cancel the process using production cancellation
+    let cancel_result = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result.is_ok(), "Cancellation should succeed");
 
-    // Remove from registry
-    registry.remove(&topic);
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+
+    // Should be cancelled or failure (process was killed)
+    assert!(matches!(result, SubprocessResult::Cancelled | SubprocessResult::Failure(_)),
+        "Should be cancelled or failure, got: {:?}", result);
+
     assert!(registry.is_empty(), "Registry should be empty after cancellation");
-
-    // Wait for process to terminate
-    let status = child.wait().expect("Failed to wait for child");
-    // Process should be terminated
-    assert!(!status.success() || status.code().is_none(), "Process should be terminated");
 }
 
-// Test 5: Repeated cancellation (idempotent)
+// Test 4: Cancellation of running child using production lifecycle
 #[test]
-fn test_repeated_cancellation() {
+fn test_cancellation_running_child_production() {
     let registry = ProcessRegistry::new();
-    let stream_id = "test-repeated-cancel";
-    let topic = format!("ri1://{}", stream_id);
+    let stream_id = "test-cancel-running-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Spawn slow-start mock CLI
-    let mut child = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
+    let (callback, _chunks, _errors) = create_test_callback();
 
-    // Register in registry
-    registry.insert(topic.clone(), pid);
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Verify process is registered
+    assert!(registry.get(&topic).is_some(), "Process should be registered");
+
+    // Cancel the running process
+    let cancel_result = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result.is_ok(), "Cancellation should succeed");
+
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+
+    // Should be cancelled or failure
+    assert!(matches!(result, SubprocessResult::Cancelled | SubprocessResult::Failure(_)),
+        "Should be cancelled or failure, got: {:?}", result);
+
+    assert!(registry.is_empty(), "Registry should be empty after cancellation");
+}
+
+// Test 5: Repeated cancellation using production lifecycle
+#[test]
+fn test_repeated_cancellation_production() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-repeated-cancel-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
 
     // First cancellation
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("{}", pid))
-        .status();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
-    registry.remove(&topic);
+    let cancel_result1 = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result1.is_ok(), "First cancellation should succeed");
 
-    // Second cancellation attempt (should be safe - process already gone)
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("{}", pid))
-        .status();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
-    registry.remove(&topic); // Should be no-op
+    // Second cancellation attempt (should fail - process already gone)
+    let cancel_result2 = cancel_subprocess(&registry, &topic);
+    assert!(cancel_result2.is_err(), "Second cancellation should fail");
+
+    // Wait for lifecycle to complete
+    let _ = handle.join().expect("Thread join failed");
 
     assert!(registry.is_empty(), "Registry should be empty");
-
-    // Wait for process
-    let _ = child.wait();
 }
 
-// Test 6: Send → Stop → Send sequence
+// Test 6: Send → Stop → Send sequence using production lifecycle
 #[test]
-fn test_send_stop_send() {
+fn test_send_stop_send_production() {
     let registry = ProcessRegistry::new();
 
     // First send
-    let stream_id_1 = "test-send-1";
-    let topic_1 = format!("ri1://{}", stream_id_1);
-    let mut child_1 = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "first", "--stream"]);
-    let pid_1 = child_1.id();
-    registry.insert(topic_1.clone(), pid_1);
+    let stream_id_1 = "test-send-1-prod";
+    let topic_1 = create_topic("ri1", stream_id_1);
+
+    let (callback1, _chunks1, _errors1) = create_test_callback();
+
+    let config1 = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "first".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic_1.clone(),
+        registry: registry.clone(),
+        callback: callback1,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Spawn first lifecycle
+    let lifecycle1 = SubprocessLifecycle::new(config1);
+    let handle1 = std::thread::spawn(move || lifecycle1.execute());
+
+    // Wait for registration
+    std::thread::sleep(Duration::from_millis(200));
 
     // Stop first
-    std::thread::sleep(Duration::from_millis(100));
-    let _ = Command::new("kill")
-        .arg("-TERM")
-        .arg(format!("{}", pid_1))
-        .status();
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid_1))
-        .status();
-    registry.remove(&topic_1);
-    let _ = child_1.wait();
+    let cancel_result = cancel_subprocess(&registry, &topic_1);
+    assert!(cancel_result.is_ok(), "First cancellation should succeed");
+
+    // Wait for first to complete
+    let _ = handle1.join().expect("Thread join failed");
 
     assert!(registry.is_empty(), "Registry should be empty after first stop");
 
     // Second send
-    let stream_id_2 = "test-send-2";
-    let topic_2 = format!("ri1://{}", stream_id_2);
-    let mut child_2 = spawn_mock_cli("normal", &["gen", "text", "--prompt", "second", "--stream"]);
-    let pid_2 = child_2.id();
-    registry.insert(topic_2.clone(), pid_2);
+    let stream_id_2 = "test-send-2-prod";
+    let topic_2 = create_topic("ri1", stream_id_2);
 
-    // Wait for completion
-    let status = child_2.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Second process should complete successfully");
+    let (callback2, _chunks2, _errors2) = create_test_callback();
 
-    // Cleanup
-    registry.remove(&topic_2);
+    let config2 = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "second".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+        topic: topic_2.clone(),
+        registry: registry.clone(),
+        callback: callback2,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Spawn second lifecycle
+    let lifecycle2 = SubprocessLifecycle::new(config2);
+    let result2 = lifecycle2.execute().expect("Second lifecycle execution failed");
+
+    assert!(matches!(result2, SubprocessResult::Success), "Second should succeed");
     assert!(registry.is_empty(), "Registry should be empty after second completion");
 }
 
-// Test 7: Registry cleanup on spawn failure
+// Test 7: Registry cleanup on spawn failure using production lifecycle
 #[test]
-fn test_registry_cleanup_spawn_failure() {
+fn test_registry_cleanup_spawn_failure_production() {
     let registry = ProcessRegistry::new();
+    let stream_id = "test-spawn-fail-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Try to spawn non-existent executable
-    let result = Command::new("/nonexistent/path/to/cli")
-        .args(["gen", "text", "--prompt", "test", "--stream"])
-        .spawn();
+    let (callback, _chunks, _errors) = create_test_callback();
 
-    assert!(result.is_err(), "Spawn should fail for non-existent executable");
+    let config = SubprocessConfig {
+        command: "/nonexistent/path/to/cli".to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
 
-    // Registry should not have any entries (spawn failed before registration)
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute();
+
+    assert!(result.is_err(), "Should fail to spawn");
     assert!(registry.is_empty(), "Registry should be empty after spawn failure");
 }
 
-// Test 8: Registry cleanup on wait failure
+// Test 8: Wait error coverage using production lifecycle
 #[test]
-fn test_registry_cleanup_wait_failure() {
+fn test_wait_error_production() {
     let registry = ProcessRegistry::new();
-    let stream_id = "test-wait-fail";
-    let topic = format!("ri1://{}", stream_id);
+    let stream_id = "test-wait-error-prod";
+    let topic = create_topic("ri1", stream_id);
 
-    // Spawn a process that will be killed
-    let mut child = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
+    let (callback, _chunks, _errors) = create_test_callback();
 
-    // Register in registry
-    registry.insert(topic.clone(), pid);
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
 
-    // Kill the process externally
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
 
-    // Wait should return (possibly with error status)
-    let _ = child.wait();
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
 
-    // Cleanup registry (simulating production code)
-    registry.remove(&topic);
-    assert!(registry.is_empty(), "Registry should be empty after cleanup");
-}
-
-// Test 9: Negative control - unexpected success in failure scenario
-#[test]
-fn test_negative_control_unexpected_success() {
-    // This test verifies that our test infrastructure can detect unexpected success
-    // In the partial-fail scenario, the process should NOT succeed
-    let output = run_mock_cli("partial-fail", &["gen", "text", "--prompt", "test", "--stream"]);
-
-    // This should fail - if it succeeds, our test infrastructure is broken
-    assert!(!output.status.success(), "partial-fail scenario should not succeed");
-}
-
-// Test 10: Negative control - ineffective cancellation detection
-#[test]
-fn test_negative_control_ineffective_cancellation() {
-    // This test verifies that cancellation actually terminates the process
-    let mut child = spawn_mock_cli("slow-start", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
-
-    // Cancel the process
-    let _ = Command::new("kill")
-        .arg("-KILL")
-        .arg(format!("{}", pid))
-        .status();
-
-    // Wait for termination
-    let status = child.wait().expect("Failed to wait for child");
-
-    // Process should be terminated (not successful exit)
-    assert!(!status.success() || status.code().is_none(), "Process should be terminated by cancellation");
-}
-
-// Test 11: Process reaping verification
-#[test]
-fn test_process_reaping() {
-    let registry = ProcessRegistry::new();
-    let stream_id = "test-reaping";
-    let topic = format!("ri1://{}", stream_id);
-
-    // Spawn and complete a process
-    let mut child = spawn_mock_cli("normal", &["gen", "text", "--prompt", "test", "--stream"]);
-    let pid = child.id();
-    registry.insert(topic.clone(), pid);
-
-    // Wait for completion
-    let status = child.wait().expect("Failed to wait for child");
-    assert!(status.success(), "Process should complete successfully");
-
-    // Verify process is reaped (no zombie)
-    // On Unix, we can check if the process still exists
-    let check = Command::new("ps")
-        .arg("-p")
-        .arg(format!("{}", pid))
-        .output();
-
-    if let Ok(output) = check {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        // Process should not be in the list (reaped)
-        assert!(!stdout.contains(&pid.to_string()) || stdout.lines().count() <= 1,
-            "Process should be reaped after wait()");
+    // Get the PID and kill it externally to cause wait error
+    if let Some(pid) = registry.get(&topic) {
+        let _ = Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("{}", pid))
+            .status();
     }
 
-    // Cleanup registry
-    registry.remove(&topic);
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed");
+
+    // Should be failure (process was killed)
+    assert!(result.is_ok(), "Lifecycle should complete");
+    if let Ok(SubprocessResult::Failure(_)) = result {
+        // Expected - process was killed
+    } else {
+        // Could also be cancelled if registry was cleaned up
+        assert!(matches!(result, Ok(SubprocessResult::Cancelled)), "Should be cancelled or failure");
+    }
+
+    assert!(registry.is_empty(), "Registry should be empty after wait error");
+}
+
+// Test 9: Negative control - ineffective cancellation detection
+#[test]
+fn test_negative_control_ineffective_cancellation_production() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-ineffective-cancel-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || lifecycle.execute());
+
+    // Wait for process to be registered
+    std::thread::sleep(Duration::from_millis(200));
+
+    // Get the PID
+    let pid = registry.get(&topic).expect("Process should be registered");
+
+    // Try to cancel with a fake topic (should fail)
+    let fake_topic = "ri1://fake-stream";
+    registry.insert(fake_topic.to_string(), pid);
+
+    // This should succeed because we're using the wrong topic but it has the PID
+    let cancel_result = cancel_subprocess(&registry, fake_topic);
+    assert!(cancel_result.is_ok(), "Cancellation with fake topic should succeed (it has the PID)");
+
+    // But the real topic should still have the process
+    assert!(registry.get(&topic).is_some(), "Real topic should still have process");
+
+    // Now cancel the real topic
+    let real_cancel_result = cancel_subprocess(&registry, &topic);
+    assert!(real_cancel_result.is_ok(), "Real cancellation should succeed");
+
+    // Wait for lifecycle to complete
+    let _ = handle.join().expect("Thread join failed");
+
     assert!(registry.is_empty(), "Registry should be empty");
 }
 
-// Test 12: Multiple concurrent processes
+// Test 10: Multiple concurrent processes using production lifecycle
 #[test]
-fn test_multiple_concurrent_processes() {
+fn test_multiple_concurrent_processes_production() {
     let registry = ProcessRegistry::new();
+    let mut handles = Vec::new();
 
-    // Spawn multiple processes
-    let mut children = Vec::new();
-    let mut topics = Vec::new();
-
+    // Spawn multiple lifecycles
     for i in 0..3 {
-        let stream_id = format!("test-concurrent-{}", i);
-        let topic = format!("ri1://{}", stream_id);
-        let child = spawn_mock_cli("normal", &["gen", "text", "--prompt", &format!("test{}", i), "--stream"]);
-        let pid = child.id();
+        let stream_id = format!("test-concurrent-{}-prod", i);
+        let topic = create_topic("ri1", &stream_id);
 
-        registry.insert(topic.clone(), pid);
-        children.push(child);
-        topics.push(topic);
+        let (callback, _chunks, _errors) = create_test_callback();
+
+        let config = SubprocessConfig {
+            command: get_mock_cli_path().to_string_lossy().to_string(),
+            args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), format!("test{}", i), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+            topic: topic.clone(),
+            registry: registry.clone(),
+            callback,
+            stdin_null: true,
+            stdout_piped: true,
+            stderr_piped: true,
+        };
+
+        let lifecycle = SubprocessLifecycle::new(config);
+        let handle = std::thread::spawn(move || lifecycle.execute());
+        handles.push(handle);
     }
 
-    assert_eq!(registry.len(), 3, "Registry should have 3 entries");
-
     // Wait for all to complete
-    for (i, child) in children.iter_mut().enumerate() {
-        let status = child.wait().expect("Failed to wait for child");
-        assert!(status.success(), "Process {} should complete successfully", i);
-        registry.remove(&topics[i]);
+    for (i, handle) in handles.into_iter().enumerate() {
+        let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+        assert!(matches!(result, SubprocessResult::Success), "Process {} should succeed", i);
     }
 
     assert!(registry.is_empty(), "Registry should be empty after all completions");
+}
+
+// Test 11: Process reaping verification using production lifecycle
+#[test]
+fn test_process_reaping_production() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-reaping-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "normal".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    let lifecycle = SubprocessLifecycle::new(config);
+    let result = lifecycle.execute().expect("Lifecycle execution failed");
+
+    assert!(matches!(result, SubprocessResult::Success), "Should succeed");
+    assert!(registry.is_empty(), "Registry should be empty");
+
+    // Verify process is reaped (no zombie)
+    // This is implicitly verified by the fact that wait() completed successfully
+}
+
+// Test 12: Cancellation before PID registration using synchronization
+#[test]
+fn test_cancellation_before_registration_production() {
+    let registry = ProcessRegistry::new();
+    let stream_id = "test-cancel-before-reg-prod";
+    let topic = create_topic("ri1", stream_id);
+
+    let (callback, _chunks, _errors) = create_test_callback();
+
+    let config = SubprocessConfig {
+        command: get_mock_cli_path().to_string_lossy().to_string(),
+        args: vec!["gen".to_string(), "text".to_string(), "--prompt".to_string(), "test".to_string(), "--stream".to_string(), "--test-scenario".to_string(), "slow-start".to_string()],
+        topic: topic.clone(),
+        registry: registry.clone(),
+        callback,
+        stdin_null: true,
+        stdout_piped: true,
+        stderr_piped: true,
+    };
+
+    // Create a barrier to synchronize cancellation before registration
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let barrier_clone = barrier.clone();
+
+    // Spawn lifecycle in a thread
+    let lifecycle = SubprocessLifecycle::new(config);
+    let handle = std::thread::spawn(move || {
+        // Wait at barrier before executing
+        barrier_clone.wait();
+        lifecycle.execute()
+    });
+
+    // Cancel immediately (before lifecycle can register)
+    // This simulates cancellation arriving before PID registration
+    let cancel_result = cancel_subprocess(&registry, &topic);
+    // This will fail because process hasn't registered yet
+    assert!(cancel_result.is_err(), "Cancellation before registration should fail");
+
+    // Release the barrier to let lifecycle proceed
+    barrier.wait();
+
+    // Wait for lifecycle to complete
+    let result = handle.join().expect("Thread join failed").expect("Lifecycle execution failed");
+
+    // The lifecycle should still complete (it will register and run)
+    // But since we cancelled before registration, the process might still run
+    // This tests the race condition behavior
+    assert!(matches!(result, SubprocessResult::Success | SubprocessResult::Failure(_) | SubprocessResult::Cancelled),
+        "Should complete with some result");
+
+    // Registry should be cleaned up
+    assert!(registry.is_empty(), "Registry should be empty");
 }

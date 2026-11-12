@@ -1,4 +1,5 @@
 mod basin;
+pub mod subprocess;
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 use tauri::Emitter;
 use std::collections::HashMap;
@@ -7,21 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
-
-#[derive(Clone)]
-struct ProcessRegistry(Arc<Mutex<HashMap<String, u32>>>);
-
-impl ProcessRegistry {
-    fn insert(&self, key: String, pid: u32) {
-        if let Ok(mut m) = self.0.lock() { m.insert(key, pid); }
-    }
-    fn remove(&self, key: &str) {
-        if let Ok(mut m) = self.0.lock() { let _ = m.remove(key); }
-    }
-    fn get(&self, key: &str) -> Option<u32> {
-        self.0.lock().ok().and_then(|m| m.get(key).copied())
-    }
-}
+use subprocess::{ProcessRegistry, SubprocessConfig, SubprocessLifecycle, SubprocessResult, StreamCallback, cancel_subprocess, create_topic};
 
 #[derive(serde::Serialize, serde::Deserialize, Clone, Debug)]
 pub struct CrmSnapshot {
@@ -899,23 +886,10 @@ async fn gen_ollama_stream(
 // Attempt to cancel a running stream by killing the tracked PID.
 #[tauri::command]
 async fn cancel_stream(state: tauri::State<'_, ProcessRegistry>, stream_id: String, backend: Option<String>) -> Result<(), String> {
-    use std::process::Command;
     // Compose key with scheme used when registering
-    let key = match backend.as_deref() {
-        Some("ollama") => format!("ollama://{}", stream_id),
-        Some("kosmos") => format!("kosmos://{}", stream_id),
-        _ => format!("ri1://{}", stream_id),
-    };
-    if let Some(pid) = state.get(&key) {
-        // Try SIGTERM then SIGKILL
-        let _ = Command::new("kill").arg(format!("-TERM")).arg(format!("{}", pid)).status();
-        // Best effort immediate kill as follow-up
-        let _ = Command::new("kill").arg(format!("-KILL")).arg(format!("{}", pid)).status();
-        state.remove(&key);
-        Ok(())
-    } else {
-        Err("no running process for stream".to_string())
-    }
+    let backend_str = backend.as_deref().unwrap_or("ri1");
+    let key = create_topic(backend_str, &stream_id);
+    cancel_subprocess(state.inner(), &key)
 }
 
 #[derive(serde::Serialize)]
@@ -1122,6 +1096,24 @@ struct Ri1Chunk<'a> {
     done: bool,
 }
 
+// Tauri callback implementation for StreamCallback
+struct TauriStreamCallback {
+    app: tauri::AppHandle,
+    topic: String,
+}
+
+impl StreamCallback for TauriStreamCallback {
+    fn emit_chunk(&self, topic: &str, chunk: &str, done: bool) {
+        let _ = self.app.emit(topic, Ri1Chunk { chunk, done });
+    }
+
+    fn emit_error(&self, topic: &str, error: &str) {
+        // For errors, we emit a chunk with done=true and the error message
+        // The frontend will handle this as an error
+        let _ = self.app.emit(topic, Ri1Chunk { chunk: error, done: true });
+    }
+}
+
 // Stream `ri1-cli gen text` output to the frontend.
 #[tauri::command]
 async fn gen_ri1_stream(
@@ -1136,9 +1128,9 @@ async fn gen_ri1_stream(
 ) -> Result<(), String> {
     let topic = format!("ri1://{}", stream_id);
     let registry = state.inner().clone();
+
     tauri::async_runtime::spawn_blocking(move || {
         use std::env;
-        use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
 
         fn find_ri1_cli(override_path: Option<String>) -> Option<String> {
@@ -1183,61 +1175,29 @@ async fn gen_ri1_stream(
         }
         if verbose.unwrap_or(false) { args.push("--verbose".into()); }
 
-        let mut child = Command::new(ri1_bin)
-            .args(&args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| {
-                // Cleanup on spawn failure
-                registry.remove(&topic);
-                format!("failed to spawn ri1-cli: {}", e)
-            })?;
+        // Create Tauri callback for event emission
+        let callback = Arc::new(TauriStreamCallback {
+            app: app.clone(),
+            topic: topic.clone(),
+        });
 
-        // Register immediately after spawning so cancellation can find it
-        registry.insert(topic.clone(), child.id());
+        // Use shared subprocess lifecycle
+        let config = SubprocessConfig {
+            command: ri1_bin,
+            args,
+            topic: topic.clone(),
+            registry: registry.clone(),
+            callback,
+            stdin_null: true,
+            stdout_piped: true,
+            stderr_piped: true,
+        };
 
-        // stderr streamer
-        let mut stderr_handle_opt = None;
-        if let Some(stderr) = child.stderr.take() {
-            let topic_clone = topic.clone();
-            let app_clone = app.clone();
-            stderr_handle_opt = Some(std::thread::spawn(move || {
-                let reader = BufReader::new(stderr);
-                for line in reader.lines() {
-                    if let Ok(l) = line { let msg = format!("[err] {}", l); let _ = app_clone.emit(&topic_clone, Ri1Chunk { chunk: &msg, done: false }); } else { break; }
-                }
-            }));
-        }
-
-        if let Some(stdout) = child.stdout.take() {
-            let reader = BufReader::new(stdout);
-            for line in reader.lines() {
-                match line {
-                    Ok(l) => { 
-                        // Emit line with space to preserve word boundaries
-                        let chunk_with_space = if l.is_empty() { l } else { format!("{} ", l) };
-                        let _ = app.emit(&topic, Ri1Chunk { chunk: &chunk_with_space, done: false }); 
-                    },
-                    Err(_) => break,
-                }
-            }
-        }
-
-        if let Some(h) = stderr_handle_opt { let _ = h.join(); }
-        let status = child.wait().map_err(|e| {
-            // Cleanup registry on wait failure
-            registry.remove(&topic);
-            format!("wait error: {}", e)
-        })?;
-        registry.remove(&topic);
-        // Only emit done on success - failed exits should reach error handling
-        if status.success() {
-            let _ = app.emit(&topic, Ri1Chunk { chunk: "", done: true });
-            Ok(())
-        } else {
-            Err(format!("ri1-cli exited with status: {}", status))
+        let lifecycle = SubprocessLifecycle::new(config);
+        match lifecycle.execute()? {
+            SubprocessResult::Success => Ok(()),
+            SubprocessResult::Failure(err) => Err(err),
+            SubprocessResult::Cancelled => Ok(()), // Cancellation is not an error
         }
     })
     .await
@@ -1250,7 +1210,7 @@ async fn gen_ri1_stream(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
-        .manage(ProcessRegistry(Arc::new(Mutex::new(HashMap::new()))))
+        .manage(ProcessRegistry::new())
         .manage(ProtocolStore::new())
         .manage(PdfLibraryStore::new())
         .invoke_handler(tauri::generate_handler![
