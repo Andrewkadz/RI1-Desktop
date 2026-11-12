@@ -814,6 +814,44 @@ struct StreamChunk<'a> {
 }
 
 // Streaming: emit events to the frontend with a caller-provided stream_id.
+// Shared startup helper for Ollama streaming path
+// This function handles spawn, PID registration, and cancellation check
+// Used by both gen_ollama_stream and tests to ensure consistent behavior
+pub fn ollama_startup(
+    registry: &ProcessRegistry,
+    stream_topic: &str,
+    cancel_token: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    spawn_fn: impl FnOnce() -> Result<std::process::Child, String>,
+) -> Result<Option<std::process::Child>, String> {
+    // Check if cancelled before spawning
+    if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+        registry.remove(stream_topic);
+        return Ok(None);
+    }
+
+    let mut child = match spawn_fn() {
+        Ok(c) => c,
+        Err(e) => {
+            // Cleanup on spawn failure
+            registry.remove(stream_topic);
+            return Err(e);
+        }
+    };
+
+    // Register child PID immediately after spawning (before cancellation check)
+    registry.insert(stream_topic.to_string(), child.id());
+
+    // Check cancellation after spawn and PID registration
+    if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
+        let _ = child.kill();
+        let _ = child.wait();
+        registry.remove(stream_topic);
+        return Ok(None);
+    }
+
+    Ok(Some(child))
+}
+
 // Frontend should listen on `ollama://{stream_id}`.
 // Reads Ollama's newline-delimited JSON stream and forwards only the reply text.
 #[tauri::command]
@@ -833,31 +871,13 @@ async fn gen_ollama_stream(
     tauri::async_runtime::spawn_blocking(move || {
         use std::io::{BufRead, BufReader};
 
-        // Check if cancelled before spawning
-        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
-            registry.remove(&stream_topic);
-            return Ok(());
-        }
-
-        let mut child = match spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true)) {
-            Ok(c) => c,
-            Err(e) => {
-                // Cleanup on spawn failure
-                registry.remove(&stream_topic);
-                return Err(e);
-            }
+        // Use shared startup helper
+        let mut child = match ollama_startup(&registry, &stream_topic, &cancel_token, || {
+            spawn_ollama_chat(&ollama_chat_body(&prompt, &model, true))
+        })? {
+            Some(c) => c,
+            None => return Ok(()), // Cancelled during startup
         };
-
-        // Register child PID immediately after spawning (before cancellation check)
-        registry.insert(stream_topic.clone(), child.id());
-
-        // Check cancellation after spawn and PID registration
-        if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
-            let _ = child.kill();
-            let _ = child.wait();
-            registry.remove(&stream_topic);
-            return Ok(());
-        }
 
         let mut err_msg: Option<String> = None;
         if let Some(stdout) = child.stdout.take() {

@@ -230,7 +230,8 @@ function App() {
   ]);
   const [searchQuery, setSearchQuery] = useState("");
   const [searchResults, setSearchResults] = useState<{type: "thread" | "block" | "pdf"; id: string; text: string; score: number; threadTitle?: string}[]>([]);
-  const [model, setModel] = useState("ri1-llama:desktop");
+  const [model, setModel] = useState("ri1-assistant:latest");
+  const [availableModels, setAvailableModels] = useState<string[]>([]);
   const [useRi1, setUseRi1] = useState(false);
   const [verbose, setVerbose] = useState(false);
   const [coderMode, setCoderMode] = useState(false);
@@ -307,8 +308,8 @@ function App() {
   const [settings, setSettings] = useState<Settings>({
     ri1CliPath: "",
     kosmosPath: "",
-    defaultModel: "ri1-llama:desktop",
-    kosmosModel: "ri1-llama:desktop",
+    defaultModel: "ri1-assistant:latest",
+    kosmosModel: "ri1-assistant:latest",
     defaultOffline: true,
     defaultEmitRaw: true,
     ollamaEndpoint: "http://127.0.0.1:11434",
@@ -330,7 +331,7 @@ function App() {
   }
   // Kosmos state
   const [kPrompt, setKPrompt] = useState("");
-  const [kModel, setKModel] = useState("ri1-llama:desktop");
+  const [kModel, setKModel] = useState("ri1-assistant:latest");
   const [kOffline, setKOffline] = useState(true);
   const [kEmitRaw, setKEmitRaw] = useState(true);
   const [kOutput, setKOutput] = useState("");
@@ -550,16 +551,16 @@ function App() {
       const raw = localStorage.getItem(SETTINGS_KEY);
       if (raw) {
         const s = JSON.parse(raw) as Settings;
-        // Merge stored settings but force models to ri1-llama:desktop so we don't resurrect old model names
+        // Merge stored settings but use new default model if stored model doesn't exist
         setSettings((prev) => ({
           ...prev,
           ...s,
-          defaultModel: "ri1-llama:desktop",
-          kosmosModel: "ri1-llama:desktop",
+          defaultModel: s.defaultModel || "ri1-assistant:latest",
+          kosmosModel: s.kosmosModel || "ri1-assistant:latest",
         }));
-        // Always enforce ri1-llama:desktop as the active models by default
-        setModel("ri1-llama:desktop");
-        setKModel("ri1-llama:desktop");
+        // Set active models from settings or use default
+        setModel(s.defaultModel || "ri1-assistant:latest");
+        setKModel(s.kosmosModel || "ri1-assistant:latest");
         if (typeof s.defaultOffline === "boolean") setKOffline(s.defaultOffline);
         if (typeof s.defaultEmitRaw === "boolean") setKEmitRaw(s.defaultEmitRaw);
         if (s.ollamaEndpoint) {
@@ -574,14 +575,26 @@ function App() {
     try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch {}
   }
 
-  // Ollama health check (model list no longer used; we just care if daemon is up)
+  // Ollama health check and model list
   async function refreshModelsAndHealth() {
     try {
       const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
       const health = await invoke<{ running: boolean; endpoint: string; models: string[] }>("check_ollama", { endpoint });
       setDaemonRunning((health as any).running);
+      if (health.models && health.models.length > 0) {
+        setAvailableModels(health.models);
+        // If current chat model is not in the list, set to first available model
+        if (!health.models.includes(model)) {
+          setModel(health.models[0]);
+        }
+        // If current Kosmos model is not in the list, set to first available model
+        if (!health.models.includes(kModel)) {
+          setKModel(health.models[0]);
+        }
+      }
     } catch {
       setDaemonRunning(false);
+      setAvailableModels([]);
     }
   }
 
@@ -1352,12 +1365,14 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
       }
       // Kick off streaming on backend
       if (useRi1) {
-        // Ensure ri1-8b is used with RI1 for symbolic operations
-        const ri1Model = model || "ri1-llama:desktop";
+        // Use selected model for RI1 engine
+        const ri1Model = model || availableModels[0] || "ri1-assistant:latest";
         console.log("RI1 Engine using model:", ri1Model);
         await invoke("gen_ri1_stream", { prompt: fullPrompt, model: ri1Model, ri1CliPath: settings.ri1CliPath || undefined, ollamaEndpoint: settings.ollamaEndpoint || undefined, streamId, verbose });
       } else {
-        await invoke("gen_ollama_stream", { prompt: fullPrompt, model, streamId });
+        // Use selected model for Ollama
+        const ollamaModel = model || availableModels[0] || "ri1-assistant:latest";
+        await invoke("gen_ollama_stream", { prompt: fullPrompt, model: ollamaModel, streamId });
       }
     } catch (e: any) {
       // Check if request was cancelled - don't trigger fallback
@@ -1378,7 +1393,7 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
       // RI1 has no non-streaming fallback, so just show error
       if (!useRi1) {
         try {
-          const fallbackModel = model || "ri1-llama:desktop";
+          const fallbackModel = model || availableModels[0] || "ri1-assistant:latest";
           const out = await invoke<string>("gen_ollama", { prompt: fullPrompt, model: fallbackModel });
 
           // Check ownership after fallback response
@@ -1795,10 +1810,22 @@ ${messages.map(m => `<div class="msg ${m.role}"<strong>${m.role === "user" ? "Yo
       {(tab === "chat" || tab === "coder") && (
         <>
           <div className="row" style={{ gap: 8, alignItems: isTiny ? "stretch" : "center", flexWrap: "wrap" }}>
-            {/* Model is fixed to ri1-8b; show as read-only text instead of a dropdown */}
+            {/* Model selection dropdown */}
             <div style={{ minWidth: 160, flex: isTiny ? "1 1 100%" : "1 1 220px", padding: `${basePad}px`, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
               <div style={{ opacity: 0.7, fontSize: 11 }}>Model</div>
-              <div>ri1-llama:desktop (fixed)</div>
+              <select
+                value={model}
+                onChange={(e) => setModel(e.target.value)}
+                style={{ width: "100%", background: "transparent", border: "none", color: "inherit", fontSize: "inherit", padding: 0 }}
+              >
+                {availableModels.length === 0 ? (
+                  <option value={model}>{model} (no models found)</option>
+                ) : (
+                  availableModels.map((m) => (
+                    <option key={m} value={m}>{m}</option>
+                  ))
+                )}
+              </select>
             </div>
             <input
               value={settings.ollamaEndpoint || ""}
@@ -2164,7 +2191,7 @@ ${messages.map(m => `<div class="msg ${m.role}"<strong>${m.role === "user" ? "Yo
         </section>
       )}
 
-      {tab === "workshop" && <Workshop defaultModel={model || "ri1-llama:desktop"} />}
+      {tab === "workshop" && <Workshop defaultModel={model || "ri1-assistant:latest"} />}
 
       {tab === "crm" && (
         <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
@@ -2293,13 +2320,19 @@ ${messages.map(m => `<div class="msg ${m.role}"<strong>${m.role === "user" ? "Yo
       {tab === "kosmos" && (
         <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
           <div className="row" style={{ gap: 8 }}>
-            <input
+            <select
               value={kModel}
-              onChange={(e) => setKModel(e.currentTarget.value)}
-              placeholder="Ollama model for Kosmos"
+              onChange={(e) => setKModel(e.target.value)}
               style={{ minWidth: 280 }}
-              list="ollama-models"
-            />
+            >
+              {availableModels.length === 0 ? (
+                <option value={kModel}>{kModel} (no models found)</option>
+              ) : (
+                availableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))
+              )}
+            </select>
             <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
               <input type="checkbox" checked={kOffline} onChange={(e) => setKOffline(e.currentTarget.checked)} /> Offline
             </label>
@@ -3414,18 +3447,46 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
             <button onClick={() => void refreshModelsAndHealth()}>Check</button>
             <span style={{ fontSize: 12, opacity: 0.8 }}>{daemonRunning === null ? "checking…" : daemonRunning ? "daemon: up" : "daemon: down"}</span>
           </div>
-          {/* Model selection is fixed to ri1-8b; hide editable model fields to avoid confusion */}
+          {/* Model selection dropdowns */}
           <div className="row" style={{ gap: 8 }}>
             <label style={{ minWidth: 140 }}>Default Chat Model</label>
-            <div style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
-              ri1-llama:desktop (fixed)
-            </div>
+            <select
+              value={settings.defaultModel}
+              onChange={(e) => {
+                const newModel = e.target.value;
+                saveSettings({ ...settings, defaultModel: newModel });
+                setModel(newModel);
+              }}
+              style={{ flex: 1 }}
+            >
+              {availableModels.length === 0 ? (
+                <option value={settings.defaultModel}>{settings.defaultModel} (no models found)</option>
+              ) : (
+                availableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))
+              )}
+            </select>
           </div>
           <div className="row" style={{ gap: 8 }}>
             <label style={{ minWidth: 140 }}>Default Kosmos Model</label>
-            <div style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
-              ri1-llama:desktop (fixed)
-            </div>
+            <select
+              value={settings.kosmosModel}
+              onChange={(e) => {
+                const newModel = e.target.value;
+                saveSettings({ ...settings, kosmosModel: newModel });
+                setKModel(newModel);
+              }}
+              style={{ flex: 1 }}
+            >
+              {availableModels.length === 0 ? (
+                <option value={settings.kosmosModel}>{settings.kosmosModel} (no models found)</option>
+              ) : (
+                availableModels.map((m) => (
+                  <option key={m} value={m}>{m}</option>
+                ))
+              )}
+            </select>
           </div>
           <div className="row" style={{ gap: 12 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
