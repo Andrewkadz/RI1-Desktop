@@ -1,0 +1,346 @@
+.logo.vite:hover {
+  filter: drop-shadow(0 0 2em #747bff);
+}
+
+.logo.react:hover {
+  filter: drop-shadow(0 0 2em #61dafb);
+}
+
+/* 🌌 COSMIC AURORA - Seriously Unique Color System */
+:root {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Inter", "SF Pro Display", Helvetica, Arial, sans-serif;
+  font-size: 16px;
+  line-height: 1.6;
+  font-weight: 400;
+
+  /* Animated cosmic background with aurora effect */
+  color: #e8f4f8;
+  background: 
+    radial-gradient(ellipse at top, rgba(20, 255, 200, 0.08) 0%, transparent 50%),
+    radial-gradient(ellipse at bottom right, rgba(147, 51, 234, 0.12) 0%, transparent 50%),
+    radial-gradient(ellipse at bottom left, rgba(14, 165, 233, 0.1) 0%, transparent 50%),
+    linear-gradient(180deg, #020617 0%, #0c1222 50%, #050814 100%);
+  background-attachment: fixed;
+
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-text-size-adjust: 100%;
+  
+  /* Unique Aurora-inspired palette */
+  --primary: #14f195;
+  --primary-hover: #5fffc0;
+  --primary-glow: rgba(20, 241, 149, 0.4);
+  
+  --secondary: #9333ea;
+  --secondary-hover: #a855f7;
+  --secondary-glow: rgba(147, 51, 234, 0.4);
+  
+  --accent: #0ea5e9;
+  --accent-hover: #38bdf8;
+  --accent-glow: rgba(14, 165, 233, 0.4);
+  
+  --gold: #fbbf24;
+  --gold-glow: rgba(251, 191, 36, 0.3);
+  
+  --success: #10b981;
+  --danger: #ef4444;
+  
+  /* Glassmorphic surfaces */
+  --surface: rgba(15, 23, 42, 0.6);
+  --surface-elevated: rgba(30, 41, 59, 0.75);
+  --surface-glass: rgba(255, 255, 255, 0.05);
+  
+  /* Borders with aurora glow */
+  --border: rgba(20, 241, 149, 0.15);
+  --border-secondary: rgba(147, 51, 234, 0.15);
+  --border-accent: rgba(14, 165, 233, 0.15);
+  
+  /* Text hierarchy */
+  --text: #f1f5f9;
+  --text-secondary: #cbd5e1;
+  --text-muted: #94a3b8;
+  --text-ghost: #64748b;
+  
+  /* Aurora-enhanced shadows */
+  --shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 
+            0 2px 4px -1px rgba(20, 241, 149, 0.1);
+  --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.5), 
+               0 4px 6px -2px rgba(20, 241, 149, 0.15),
+               0 0 20px rgba(147, 51, 234, 0.1);
+  --shadow-glow: 0 0 30px rgba(20, 241, 149, 0.3),
+                 0 0 60px rgba(147, 51, 234, 0.2);
+}
+
+.container {
+  margin: 0;
+  padding-top: 10vh;
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  text-align: center;
+}
+
+.logo {
+  height: 6em;
+  padding: 1.5em;
+  will-change: filter;
+  transition: 0.75s;
+}
+
+.logo.tauri:hover {
+  filter: drop-shadow(0 0 2em #24c8db);
+}
+
+.row {
+  display: flex;
+  justify-content: center;
+}
+
+a {
+  font-weight: 500;
+  color: #646cff;
+  text-decoration: inherit;
+}
+
+a:hover {
+  color: #535bf2;
+}
+
+/* Cosmic Aurora Typography */
+h1 { 
+  text-align: center; 
+  color: var(--text);
+}
+
+.app-title {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 50%, var(--secondary) 100%);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  font-weight: 700;
+  letter-spacing: -0.5px;
+  filter: drop-shadow(0 0 20px var(--primary-glow));
+  animation: shimmer 3s ease-in-out infinite;
+}
+
+@keyframes shimmer {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.85; }
+}
+
+h2, h3, h4 {
+  color: var(--text);
+  font-weight: 600;
+  letter-spacing: -0.3px;
+}
+
+/* Premium Inputs */
+input, textarea {
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  padding: 0.7em 1.1em;
+  font-size: 0.95em;
+  font-weight: 400;
+  font-family: inherit;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  background: var(--surface);
+  backdrop-filter: blur(10px);
+}
+
+input:focus, textarea:focus {
+  outline: none;
+  border-color: var(--primary);
+  box-shadow: 0 0 0 3px rgba(139, 92, 246, 0.1), var(--shadow);
+  background: var(--surface-elevated);
+}
+
+input::placeholder, textarea::placeholder {
+  color: var(--text-muted);
+  opacity: 0.6;
+}
+
+/* Cosmic Aurora Buttons */
+button {
+  border-radius: 10px;
+  border: 1.5px solid var(--border);
+  padding: 0.65em 1.3em;
+  font-size: 0.95em;
+  font-weight: 600;
+  font-family: inherit;
+  cursor: pointer;
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 100%);
+  color: #020617;
+  box-shadow: var(--shadow), 0 0 20px var(--primary-glow);
+  position: relative;
+  overflow: hidden;
+}
+
+button::before {
+  content: '';
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: linear-gradient(135deg, var(--primary-hover) 0%, var(--accent-hover) 100%);
+  opacity: 0;
+  transition: opacity 0.3s;
+}
+
+button::after {
+  content: '';
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 0;
+  height: 0;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.3);
+  transform: translate(-50%, -50%);
+  transition: width 0.6s, height 0.6s;
+}
+
+button:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg), var(--shadow-glow);
+  border-color: var(--primary);
+}
+
+button:hover::before {
+  opacity: 1;
+}
+
+button:active::after {
+  width: 300px;
+  height: 300px;
+  transition: 0s;
+}
+
+button:active {
+  transform: translateY(0);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: var(--shadow);
+}
+
+input,
+button {
+  outline: none;
+}
+
+#greet-input {
+  margin-right: 5px;
+}
+
+/* Premium Message Bubbles */
+.messages { 
+  display: flex; 
+  flex-direction: column; 
+  gap: 14px;
+}
+
+.msg { 
+  text-align: left; 
+  padding: 14px 18px; 
+  border-radius: 14px;
+  border: 1.5px solid rgba(139, 92, 246, 0.15);
+  box-shadow: var(--shadow);
+  backdrop-filter: blur(10px);
+  transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+  animation: slideIn 0.3s ease-out;
+}
+
+.msg:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-lg);
+  border-color: rgba(139, 92, 246, 0.3);
+}
+
+.msg.user { 
+  background: linear-gradient(135deg, 
+    rgba(20, 241, 149, 0.15) 0%, 
+    rgba(14, 165, 233, 0.2) 100%);
+  color: var(--text); 
+  align-self: flex-end;
+  border: 1.5px solid var(--border);
+  box-shadow: var(--shadow), 
+              inset 0 1px 0 rgba(20, 241, 149, 0.1),
+              0 0 30px rgba(20, 241, 149, 0.1);
+}
+
+.msg.user:hover {
+  border-color: var(--primary);
+  box-shadow: var(--shadow-lg), 
+              inset 0 1px 0 rgba(20, 241, 149, 0.2),
+              0 0 40px rgba(20, 241, 149, 0.2);
+}
+
+.msg.ai { 
+  background: linear-gradient(135deg,
+    rgba(147, 51, 234, 0.1) 0%,
+    rgba(30, 41, 59, 0.6) 100%);
+  color: var(--text);
+  border: 1.5px solid var(--border-secondary);
+  align-self: flex-start;
+  box-shadow: var(--shadow),
+              inset 0 1px 0 rgba(147, 51, 234, 0.05),
+              0 0 25px rgba(147, 51, 234, 0.08);
+}
+
+.msg.ai:hover {
+  border-color: var(--secondary);
+  box-shadow: var(--shadow-lg),
+              inset 0 1px 0 rgba(147, 51, 234, 0.1),
+              0 0 35px rgba(147, 51, 234, 0.12);
+}
+
+/* Smooth slide-in animation */
+@keyframes slideIn {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* Smooth fade-in for elements */
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+
+/* Cosmic Aurora Scrollbar */
+::-webkit-scrollbar {
+  width: 12px;
+  height: 12px;
+}
+
+::-webkit-scrollbar-track {
+  background: rgba(15, 23, 42, 0.5);
+  border-radius: 10px;
+  border: 1px solid rgba(20, 241, 149, 0.1);
+}
+
+::-webkit-scrollbar-thumb {
+  background: linear-gradient(135deg, var(--primary) 0%, var(--accent) 50%, var(--secondary) 100%);
+  border-radius: 10px;
+  border: 1px solid rgba(20, 241, 149, 0.3);
+  box-shadow: 0 0 10px var(--primary-glow);
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: linear-gradient(135deg, var(--primary-hover) 0%, var(--accent-hover) 50%, var(--secondary-hover) 100%);
+  box-shadow: 0 0 15px var(--primary-glow), 0 0 10px var(--secondary-glow);
+}

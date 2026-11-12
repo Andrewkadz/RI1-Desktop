@@ -1,0 +1,35 @@
+[
+  {
+    "id": "pdf-1763578701686",
+    "name": "redacted-1.pdf",
+    "path": "/redacted/redacted-1.pdf",
+    "hash": "f6a1ae43402d5b91",
+    "page_count": 0,
+    "chunk_count": 0,
+    "created_at": 1763578701686,
+    "updated_at": 1763578701686,
+    "block_ids": []
+  },
+  {
+    "id": "pdf-1763578701547",
+    "name": "redacted-2.pdf",
+    "path": "/redacted/redacted-2.pdf",
+    "hash": "1ba8c0a725300007",
+    "page_count": 0,
+    "chunk_count": 0,
+    "created_at": 1763578701547,
+    "updated_at": 1763578701547,
+    "block_ids": []
+  },
+  {
+    "id": "pdf-1763578701661",
+    "name": "redacted-3.pdf",
+    "path": "/redacted/redacted-3.pdf",
+    "hash": "d13add48e19dfbe3",
+    "page_count": 0,
+    "chunk_count": 0,
+    "created_at": 1763578701661,
+    "updated_at": 1763578701661,
+    "block_ids": []
+  }
+]

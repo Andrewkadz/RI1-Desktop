@@ -1,0 +1,3770 @@
+import { useEffect, useRef, useState } from "react";
+import { getName, getVersion } from "@tauri-apps/api/app";
+import { invoke } from "@tauri-apps/api/core";
+import { listen, UnlistenFn } from "@tauri-apps/api/event";
+import "./App.css";
+import { CommandPalette } from "./components/CommandPalette/CommandPalette";
+import { Workshop } from "./components/Workshop/Workshop";
+
+// RI1 Basin retrieval result (see src-tauri/src/basin.rs)
+type BasinHit = { tier: string; id: string; doc_id: string; doc_path: string; page: number; heading: string; text: string; score: number };
+function basinTitle(h: BasinHit): string {
+  const file = h.doc_path.split("/").pop() || h.doc_id;
+  return file.replace(/\.pdf$/i, "").replace(/^RI1[_\s-]*/i, "").replace(/\s*\(\d+\)$/, "").trim() || h.doc_id;
+}
+import type { AppContext } from "./types/commands";
+
+type Settings = {
+  ri1CliPath: string;
+  kosmosPath: string;
+  defaultModel: string;
+  kosmosModel: string;
+  defaultOffline: boolean;
+  defaultEmitRaw: boolean;
+  ollamaEndpoint?: string;
+};
+
+const SETTINGS_KEY = "ri1.settings.v1";
+const THREADS_KEY = "ri1.threads.v1";
+
+type Msg = { id: string; role: "user" | "assistant"; text: string; fullPrompt?: string; model?: string; backend?: "ri1" | "ollama" };
+
+type ReservoirState = "active" | "decaying" | "ignored";
+type MemoryMode = "phi" | "delta" | "lambda"; // Φ, Δ, Λ
+
+type ContextBlock = {
+  id: string;
+  text: string;
+  source: "pdf" | "chat" | "manual" | "system";
+  createdAt: number;
+  lastUsedAt: number | null;
+  attention: number; // 0..1
+  state: ReservoirState;
+  mode: MemoryMode;
+  tags: string[];
+  pinned: boolean;
+};
+
+type RecursiveProtocolObject = {
+  id: string;
+  name: string;
+  description: string;
+  origin: string;
+  created_at: number;
+  updated_at: number;
+  status: string;
+  schema_version: string;
+  raw_text?: string | null;
+};
+
+type PdfNode = {
+  id: string;
+  name: string;
+  path: string;
+  hash: string;
+  page_count: number;
+  chunk_count: number;
+  created_at: number;
+  updated_at: number;
+  block_ids: string[];
+};
+
+type Thread = { id: string; title: string; createdAt: number; messages: Msg[]; contextBlocks: ContextBlock[] };
+
+type CrmSnapshot = {
+  nodes: string[];
+  matrix: number[][];
+};
+
+type Plugin = {
+  id: string;
+  name: string;
+  version: string;
+  description: string;
+  enabled: boolean;
+  hooks: {
+    onMessageSent?: (message: string) => void | Promise<void>;
+    onMessageReceived?: (message: Msg) => void | Promise<void>;
+    onContextAdded?: (block: ContextBlock) => void | Promise<void>;
+    onThreadCreated?: (thread: Thread) => void | Promise<void>;
+    onExport?: (data: any) => string | Promise<string>;
+  };
+  customUI?: () => JSX.Element;
+};
+
+function App() {
+  console.log("App.tsx loaded - VERSION WITH IMPORT HANDLERS");
+  const [tab, setTab] = useState<"chat" | "kosmos" | "library" | "parser" | "search" | "graph" | "analytics" | "compare" | "coder" | "guide" | "settings" | "crm" | "workshop">("chat");
+  const [selectedNode, setSelectedNode] = useState<string | null>(null);
+  const [graphZoom, setGraphZoom] = useState(1);
+  const [graphPan, setGraphPan] = useState({ x: 0, y: 0 });
+  const [isDragging, setIsDragging] = useState(false);
+  const [dragStart, setDragStart] = useState({ x: 0, y: 0 });
+  const [comparePrompt, setComparePrompt] = useState("");
+  const [compareResults, setCompareResults] = useState<{ri1: string; ollama: string; timestamp: number} | null>(null);
+  const [comparingStatus, setComparingStatus] = useState<"idle" | "running" | "done">("idle");
+  const [ttsEnabled, setTtsEnabled] = useState(false);
+  const [ttsSpeed, setTtsSpeed] = useState(1);
+  const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
+  const [speakingMessageId, setSpeakingMessageId] = useState<string | null>(null);
+  const [plugins, setPlugins] = useState<Plugin[]>([
+    // Built-in plugins
+    {
+      id: "protocol-highlighter",
+      name: "Protocol Symbol Highlighter",
+      version: "1.0.0",
+      description: "Highlights RI1 protocol symbols in messages",
+      enabled: true,
+      hooks: {}
+    },
+    {
+      id: "message-bookmarks",
+      name: "⭐ Message Bookmarks",
+      version: "1.0.0",
+      description: "Star and save important messages for quick reference",
+      enabled: true,
+      hooks: {
+        onMessageReceived: async (msg) => {
+          // Store bookmarkable messages
+          console.log("Message received:", msg.id);
+        }
+      }
+    },
+    {
+      id: "auto-title-generator",
+      name: "🏷️ Smart Thread Titles",
+      version: "1.0.0",
+      description: "Automatically suggests better thread titles based on conversation content",
+      enabled: true,
+      hooks: {
+        onMessageReceived: async (msg) => {
+          console.log("Analyzing for title suggestions for message", msg.id);
+        }
+      }
+    },
+    {
+      id: "context-stats",
+      name: "📊 Context Statistics",
+      version: "1.0.0",
+      description: "Shows visual statistics about your context block usage and trends",
+      enabled: true,
+      hooks: {
+        onContextAdded: async (block) => {
+          console.log("Context block added:", block.mode);
+        }
+      }
+    },
+    {
+      id: "code-formatter",
+      name: "🎨 Code Syntax Highlighter",
+      version: "1.0.0",
+      description: "Automatically formats and highlights code blocks in messages",
+      enabled: true,
+      hooks: {
+        onMessageReceived: async (msg) => {
+          if (msg.text.includes("```")) {
+            console.log("Code block detected");
+          }
+        }
+      }
+    },
+    {
+      id: "export-obsidian",
+      name: "📓 Obsidian Exporter",
+      version: "1.0.0",
+      description: "Export threads to Obsidian-compatible markdown with backlinks",
+      enabled: false,
+      hooks: {
+        onExport: (data) => {
+          const thread = data as Thread;
+          const md = `# ${thread.title}\n\nCreated: ${new Date(thread.createdAt).toLocaleString()}\n\n${thread.messages.map(m => `## ${m.role === "user" ? "You" : "AI"}\n\n${m.text}\n\n`).join("---\n\n")}`;
+          return md;
+        }
+      }
+    },
+    {
+      id: "quick-notes",
+      name: "📝 Quick Notes",
+      version: "1.0.0",
+      description: "Add floating notes to threads without sending messages",
+      enabled: false,
+      hooks: {}
+    },
+    {
+      id: "auto-summarizer",
+      name: "📋 Thread Summarizer",
+      version: "1.0.0",
+      description: "Generates concise summaries of long conversations",
+      enabled: false,
+      hooks: {
+        onThreadCreated: async (thread) => {
+          console.log("New thread created:", thread.title);
+        }
+      }
+    },
+    {
+      id: "url-previewer",
+      name: "🔗 URL Link Previewer",
+      version: "1.0.0",
+      description: "Shows previews and metadata for URLs mentioned in messages",
+      enabled: false,
+      hooks: {
+        onMessageReceived: async (msg) => {
+          const urls = msg.text.match(/https?:\/\/[^\s]+/g);
+          if (urls) console.log("URLs detected:", urls.length);
+        }
+      }
+    },
+    {
+      id: "export-notion",
+      name: "Notion Exporter",
+      version: "1.0.0",
+      description: "Export threads to Notion database format",
+      enabled: false,
+      hooks: {
+        onExport: (data) => {
+          return JSON.stringify({ notion: data }, null, 2);
+        }
+      }
+    }
+  ]);
+  const [searchQuery, setSearchQuery] = useState("");
+  const [searchResults, setSearchResults] = useState<{type: "thread" | "block" | "pdf"; id: string; text: string; score: number; threadTitle?: string}[]>([]);
+  const [model, setModel] = useState("ri1-llama:desktop");
+  const [useRi1, setUseRi1] = useState(false);
+  const [verbose, setVerbose] = useState(false);
+  const [coderMode, setCoderMode] = useState(false);
+  const [showSymbols, setShowSymbols] = useState(true);
+  const [useBasin, setUseBasin] = useState(true);
+  const [basinHits, setBasinHits] = useState<BasinHit[]>([]);
+  const [basinNote, setBasinNote] = useState("");
+  const [prompt, setPrompt] = useState("");
+  // Threads
+  const [threads, setThreads] = useState<Thread[]>([]);
+  const [activeThreadId, setActiveThreadId] = useState<string>("");
+  const activeThread = threads.find(t => t.id === activeThreadId) || null;
+  const messages = activeThread?.messages || [];
+  const [protocols, setProtocols] = useState<RecursiveProtocolObject[]>([]);
+  const [selectedProtocolId, setSelectedProtocolId] = useState<string | null>(null);
+  const [extractedProtocols, setExtractedProtocols] = useState<{id: string; expression: string; explanation: string; timestamp: number; threadId: string}[]>([]);
+  const [promptTemplates, setPromptTemplates] = useState<{id: string; name: string; prompt: string; description: string; timestamp: number}[]>([]);
+  const [protocolSuggestions, setProtocolSuggestions] = useState<string[]>([]);
+  const [showSuggestions, setShowSuggestions] = useState(false);
+  const [knowledgeGraph, setKnowledgeGraph] = useState<{concept: string; relatedThreads: string[]; mentions: number; lastSeen: number}[]>([]);
+  const [userPreferences, setUserPreferences] = useState<{
+    preferredLength: "short" | "medium" | "long";
+    preferredStyle: "technical" | "conversational" | "balanced";
+    correctionsCount: number;
+    commonCorrections: {pattern: string; count: number}[];
+  }>({
+    preferredLength: "medium",
+    preferredStyle: "balanced", 
+    correctionsCount: 0,
+    commonCorrections: []
+  });
+  const [pdfNodes, setPdfNodes] = useState<PdfNode[]>([]);
+  const [selectedPdfNodeId, setSelectedPdfNodeId] = useState<string | null>(null);
+  const [activePdfNodeId, setActivePdfNodeId] = useState<string | null>(null);
+  const [docContext, setDocContext] = useState<string>("");
+  const [pdfExtracting, setPdfExtracting] = useState(false);
+  const [pdfProgress, setPdfProgress] = useState<{done: number; total: number}>({done: 0, total: 0});
+  const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [daemonRunning, setDaemonRunning] = useState<boolean | null>(null);
+  const [currentStream, setCurrentStream] = useState<{ id: string; backend: "ri1" | "ollama" } | null>(null);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [aboutName, setAboutName] = useState("");
+  const [aboutVersion, setAboutVersion] = useState("");
+  const [crmSnapshot, setCrmSnapshot] = useState<CrmSnapshot | null>(null);
+  const [crmLoading, setCrmLoading] = useState(false);
+  const [crmError, setCrmError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (tab === "coder") {
+      setCoderMode(true);
+    }
+  }, [tab]);
+  const [autoCompact, setAutoCompact] = useState(true);
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(
+    typeof window !== 'undefined' && window.innerWidth < 1000
+  );
+  const [pluginJsonInput, setPluginJsonInput] = useState("");
+  const [modelInfoOpen, setModelInfoOpen] = useState(false);
+  const [modelInfoText, setModelInfoText] = useState<string>("");
+  const [compactMode, setCompactMode] = useState(false);
+  const [windowWidth, setWindowWidth] = useState<number>(typeof window !== 'undefined' ? window.innerWidth : 1200);
+  const [editingThreadId, setEditingThreadId] = useState<string | null>(null);
+  const [editingTitle, setEditingTitle] = useState<string>("");
+  const [fullPromptModalOpen, setFullPromptModalOpen] = useState(false);
+  const [fullPromptModalText, setFullPromptModalText] = useState<string>("");
+
+  const unlistenRef = useRef<UnlistenFn | null>(null);
+  const scrollRef = useRef<HTMLDivElement | null>(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const pdfCancelRef = useRef<boolean>(false);
+  const STORAGE_KEY = "ri1.chat.history.v1"; // legacy single history key (migration only)
+  const [settings, setSettings] = useState<Settings>({
+    ri1CliPath: "",
+    kosmosPath: "",
+    defaultModel: "ri1-llama:desktop",
+    kosmosModel: "ri1-llama:desktop",
+    defaultOffline: true,
+    defaultEmitRaw: true,
+    ollamaEndpoint: "http://127.0.0.1:11434",
+  });
+
+  async function loadCrm() {
+    try {
+      setCrmLoading(true);
+      setCrmError(null);
+      const snap = await invoke<CrmSnapshot>("get_crm_switchboard", {
+        ri1CliPath: settings.ri1CliPath || undefined,
+      });
+      setCrmSnapshot(snap);
+    } catch (e: any) {
+      setCrmError(e?.toString?.() ?? "Failed to load CRM");
+    } finally {
+      setCrmLoading(false);
+    }
+  }
+  // Kosmos state
+  const [kPrompt, setKPrompt] = useState("");
+  const [kModel, setKModel] = useState("ri1-llama:desktop");
+  const [kOffline, setKOffline] = useState(true);
+  const [kEmitRaw, setKEmitRaw] = useState(true);
+  const [kOutput, setKOutput] = useState("");
+  const [kParsed, setKParsed] = useState<any | null>(null);
+  const [kPlanExpanded, setKPlanExpanded] = useState(false);
+  const [kRunning, setKRunning] = useState(false);
+  const [kUseReservoir, setKUseReservoir] = useState(true);
+  const kUnlistenRef = useRef<UnlistenFn | null>(null);
+  // On-screen symbol keyboard
+  const promptRef = useRef<HTMLTextAreaElement | null>(null);
+  const symbols: string[] = [
+    "Φ","π","ε","Λ","Δ","Ω","Ψ","Ξ","Γ","Σ","ζ","λ","ω","Τ","Ρ","δ","Θ","n","χ","→","+",":","/","|","[]","="
+  ];
+  function insertSymbol(sym: string) {
+    const el = promptRef.current;
+    if (!el) { setPrompt((p: string) => (p || "") + sym); return; }
+    const start = el.selectionStart ?? el.value.length;
+    const end = el.selectionEnd ?? el.value.length;
+    const next = (prompt.slice(0, start) + sym + prompt.slice(end));
+    setPrompt(next);
+    requestAnimationFrame(() => {
+      const pos = start + sym.length;
+      el.focus();
+      try { el.setSelectionRange(pos, pos); } catch {}
+    });
+  }
+
+  // Logs drawer and error banner
+  const [logs, setLogs] = useState<string>("");
+  const [logsOpen, setLogsOpen] = useState(false);
+
+  // Track window width for responsive stacking
+  useEffect(() => {
+    const handler = () => setWindowWidth(window.innerWidth);
+    window.addEventListener("resize", handler);
+    return () => window.removeEventListener("resize", handler);
+  }, []);
+
+  // Auto-compact mode: collapse sidebar on narrow screens or when not on chat
+  useEffect(() => {
+    if (autoCompact) {
+      // Auto-collapse if window is narrow (< 1000px) or not on chat/library tabs
+      if (windowWidth < 1000 || (tab !== "chat" && tab !== "library")) {
+        setSidebarCollapsed(true);
+      } else if (windowWidth >= 1000 && (tab === "chat" || tab === "library")) {
+        setSidebarCollapsed(false);
+      }
+    }
+  }, [autoCompact, windowWidth, tab]);
+
+  // Load known protocols once (Phase 1 RPO wiring)
+  useEffect(() => {
+    void (async () => {
+      try {
+        const list = await invoke<RecursiveProtocolObject[]>("list_protocols");
+        setProtocols(list || []);
+      } catch {
+        // ignore if backend command is missing or not yet wired
+      }
+    })();
+  }, []);
+
+  // Load PDF nodes from backend
+  useEffect(() => {
+    void (async () => {
+      try {
+        const list = await invoke<PdfNode[]>("list_pdf_nodes");
+        setPdfNodes(list || []);
+      } catch {
+        // ignore if backend command is missing or not yet wired
+      }
+    })();
+  }, []);
+
+  // Simple PDF event listeners - set up once on mount
+  useEffect(() => {
+    let unlistenChunk: UnlistenFn | null = null;
+
+    (async () => {
+      try {
+        unlistenChunk = await listen<{
+          threadId: string;
+          chunkId: string;
+          text: string;
+        }>("pdf_chunk", (e) => {
+          const { chunkId, text } = e.payload as any;
+          console.log("Received chunk:", chunkId);
+          // Add chunk using callback to avoid dependency on addContextBlockFromText
+          setThreads(prev => {
+            const active = prev.find(t => t.id === activeThreadId);
+            if (!active) return prev;
+            
+            const trimmed = text.trim();
+            if (!trimmed) return prev;
+            
+            const now = Date.now();
+            const block: ContextBlock = {
+              id: chunkId,
+              text: trimmed,
+              source: "pdf",
+              createdAt: now,
+              lastUsedAt: null,
+              attention: 0.5,
+              state: "active",
+              mode: "phi",
+              tags: [],
+              pinned: false,
+            };
+            
+            return prev.map(t => 
+              t.id === activeThreadId 
+                ? { ...t, contextBlocks: [block, ...(t.contextBlocks || [])] }
+                : t
+            );
+          });
+        });
+      } catch (err) {
+        console.error("Failed to setup PDF listeners:", err);
+      }
+    })();
+
+    return () => {
+      if (unlistenChunk) unlistenChunk();
+    };
+  }, [activeThreadId, setThreads]);
+
+  function mkStreamId() {
+    return `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  function mkBlockId() {
+    return mkStreamId();
+  }
+
+  // PDF attach helpers
+  function selectPdf() {
+    fileInputRef.current?.click();
+  }
+
+  async function onPdfSelected(e: any) {
+    const file = e?.currentTarget?.files?.[0];
+    if (!file) return;
+    try {
+      const buf = await file.arrayBuffer();
+      const arr = new Uint8Array(buf);
+      setPdfExtracting(true);
+      setPdfProgress({ done: 0, total: 0 });
+      // Send bytes to backend indexer; events will populate Context Reservoir
+      await invoke("index_pdf_stream", {
+        threadId: activeThreadId,
+        fileBytes: Array.from(arr),
+      });
+      if (fileInputRef.current) fileInputRef.current.value = "";
+    } catch (err) {
+      setError(String(err));
+      setPdfExtracting(false);
+    }
+  }
+
+  function stopPdf() { pdfCancelRef.current = true; setPdfExtracting(false); }
+
+
+  // Auto-scroll to bottom when messages update
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    el.scrollTop = el.scrollHeight;
+  }, [messages]);
+
+  // Load threads (with migration from legacy messages)
+  useEffect(() => {
+    try {
+      const rawT = localStorage.getItem(THREADS_KEY);
+      if (rawT) {
+        const parsed = JSON.parse(rawT) as any[];
+        if (Array.isArray(parsed) && parsed.length) {
+          const withContext: Thread[] = parsed.map((t) => ({
+            id: t.id,
+            title: t.title,
+            createdAt: t.createdAt,
+            messages: Array.isArray(t.messages) ? t.messages : [],
+            contextBlocks: Array.isArray(t.contextBlocks) ? t.contextBlocks : [],
+          }));
+          setThreads(withContext);
+          setActiveThreadId(parsed[0].id);
+          return;
+        }
+      }
+      // migrate legacy single-thread messages
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const parsed = JSON.parse(raw) as Msg[];
+        if (Array.isArray(parsed)) {
+          const t: Thread = { id: mkStreamId(), title: "Thread 1", createdAt: Date.now(), messages: parsed, contextBlocks: [] };
+          setThreads([t]);
+          setActiveThreadId(t.id);
+        }
+      } else {
+        // start with one empty thread
+        const t: Thread = { id: mkStreamId(), title: "Thread 1", createdAt: Date.now(), messages: [], contextBlocks: [] };
+        setThreads([t]);
+        setActiveThreadId(t.id);
+      }
+    } catch {}
+  }, []);
+
+  // Persist threads on changes
+  useEffect(() => {
+    try {
+      if (threads.length) localStorage.setItem(THREADS_KEY, JSON.stringify(threads));
+    } catch {}
+  }, [threads]);
+
+  // Load settings and prefill defaults
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(SETTINGS_KEY);
+      if (raw) {
+        const s = JSON.parse(raw) as Settings;
+        // Merge stored settings but force models to ri1-llama:desktop so we don't resurrect old model names
+        setSettings((prev) => ({
+          ...prev,
+          ...s,
+          defaultModel: "ri1-llama:desktop",
+          kosmosModel: "ri1-llama:desktop",
+        }));
+        // Always enforce ri1-llama:desktop as the active models by default
+        setModel("ri1-llama:desktop");
+        setKModel("ri1-llama:desktop");
+        if (typeof s.defaultOffline === "boolean") setKOffline(s.defaultOffline);
+        if (typeof s.defaultEmitRaw === "boolean") setKEmitRaw(s.defaultEmitRaw);
+        if (s.ollamaEndpoint) {
+          // no-op; keep in settings; trigger health fetch next effect
+        }
+      }
+    } catch {}
+  }, []);
+
+  function saveSettings(next: Settings) {
+    setSettings(next);
+    try { localStorage.setItem(SETTINGS_KEY, JSON.stringify(next)); } catch {}
+  }
+
+  // Ollama health check (model list no longer used; we just care if daemon is up)
+  async function refreshModelsAndHealth() {
+    try {
+      const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
+      const health = await invoke<{ running: boolean; endpoint: string; models: string[] }>("check_ollama", { endpoint });
+      setDaemonRunning((health as any).running);
+    } catch {
+      setDaemonRunning(false);
+    }
+  }
+
+  useEffect(() => { void refreshModelsAndHealth(); }, [settings.ollamaEndpoint]);
+
+  // Thread helpers
+  function updateActiveThreadMessages(mutator: (msgs: Msg[]) => Msg[]) {
+    setThreads(prev => prev.map(t => t.id === activeThreadId ? { ...t, messages: mutator(t.messages) } : t));
+  }
+  function newThread() {
+    const id = mkStreamId();
+    const t: Thread = { id, title: `Thread ${threads.length + 1}`, createdAt: Date.now(), messages: [], contextBlocks: [] };
+    setThreads(prev => [t, ...prev]);
+    setActiveThreadId(id);
+  }
+  function renameThread(id: string) {
+    const current = threads.find(t => t.id === id)?.title || "";
+    setEditingThreadId(id);
+    setEditingTitle(current);
+  }
+  function commitRename(id: string, title: string) {
+    const next = (title || "").trim();
+    if (!next) return;
+    setThreads(prev => prev.map(t => t.id === id ? { ...t, title: next } : t));
+    setEditingThreadId(null);
+    setEditingTitle("");
+  }
+  function cancelRename() {
+    setEditingThreadId(null);
+    setEditingTitle("");
+  }
+  function deleteThread(id: string) {
+    const next = threads.filter(t => t.id !== id);
+    setThreads(next);
+    if (activeThreadId === id && next.length) setActiveThreadId(next[0].id);
+  }
+  function clearActiveThread() { updateActiveThreadMessages(() => []); }
+
+  // Text-to-Speech functionality
+  function speakText(text: string, messageId: string) {
+    if ('speechSynthesis' in window) {
+      // Stop any ongoing speech
+      window.speechSynthesis.cancel();
+      
+      const utterance = new SpeechSynthesisUtterance(text);
+      utterance.rate = ttsSpeed;
+      utterance.pitch = 1;
+      utterance.volume = 1;
+      
+      utterance.onstart = () => setSpeakingMessageId(messageId);
+      utterance.onend = () => setSpeakingMessageId(null);
+      utterance.onerror = () => setSpeakingMessageId(null);
+      
+      window.speechSynthesis.speak(utterance);
+    } else {
+      alert("Text-to-speech not supported in this browser");
+    }
+  }
+
+  function stopSpeaking() {
+    if ('speechSynthesis' in window) {
+      window.speechSynthesis.cancel();
+      setSpeakingMessageId(null);
+    }
+  }
+
+  // Smart Prompt Templates
+  function savePromptAsTemplate() {
+    if (!prompt.trim()) return;
+    const name = window.prompt("Template name:", "");
+    if (!name) return;
+    const description = window.prompt("Description (optional):", "");
+    
+    const id = `tmpl-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    setPromptTemplates(prev => [...prev, {
+      id,
+      name,
+      prompt,
+      description: description || "",
+      timestamp: Date.now()
+    }]);
+  }
+
+  function loadTemplate(template: typeof promptTemplates[0]) {
+    setPrompt(template.prompt);
+  }
+
+  function deleteTemplate(id: string) {
+    setPromptTemplates(prev => prev.filter(t => t.id !== id));
+  }
+
+  // Protocol Pattern Recognition & Suggestions
+  function suggestProtocolCompletions(currentInput: string) {
+    const suggestions: string[] = [];
+    const lastChar = currentInput.slice(-1);
+    const lastFewChars = currentInput.slice(-3);
+    
+    // Common protocol patterns
+    const patterns = [
+      { trigger: 'Φ', suggestions: ['Φπε', 'Φ→Δ', 'Φ:Λ', 'Φ[...]'] },
+      { trigger: 'Δ', suggestions: ['Δ→Ω', 'Δ+Φ', 'Δ:Ψ'] },
+      { trigger: 'Λ', suggestions: ['Λ→Γ', 'Λ:Σ', 'Λ[...]'] },
+      { trigger: '→', suggestions: ['→Ω', '→Δ', '→Φ'] },
+      { trigger: ':', suggestions: [':Τ/Ρ', ':Δ', ':Φ'] },
+      { trigger: '/', suggestions: ['/Ρ[', '/Γ', '/Ω'] },
+    ];
+    
+    // Check for pattern triggers
+    patterns.forEach(p => {
+      if (lastChar === p.trigger || lastFewChars.includes(p.trigger)) {
+        suggestions.push(...p.suggestions);
+      }
+    });
+    
+    // Add recently used protocol expressions
+    extractedProtocols.slice(0, 5).forEach(proto => {
+      if (proto.expression.length < 30 && !suggestions.includes(proto.expression)) {
+        suggestions.push(proto.expression);
+      }
+    });
+    
+    setProtocolSuggestions([...new Set(suggestions)].slice(0, 8));
+    setShowSuggestions(suggestions.length > 0);
+  }
+
+  function handlePromptChange(newValue: string) {
+    setPrompt(newValue);
+    if (useRi1 && /[ΦπεΛΔΩΨΞΓΣζλωΤΡδΘχ→:\/\[\]]/.test(newValue)) {
+      suggestProtocolCompletions(newValue);
+    } else {
+      setShowSuggestions(false);
+    }
+  }
+
+  function applySuggestion(suggestion: string) {
+    setPrompt(prompt + suggestion);
+    setShowSuggestions(false);
+  }
+
+  // Cross-Thread Memory - Extract concepts and build knowledge graph
+  function updateKnowledgeGraph(text: string, threadId: string) {
+    const concepts: string[] = [];
+    
+    // Extract key concepts
+    const protocolSymbols = text.match(/[ΦπεΛΔΩΨΞΓΣζλωΤΡδΘχ]/g) || [];
+    concepts.push(...protocolSymbols);
+    
+    // Extract important keywords (capitalized words, technical terms)
+    const keywords = text.match(/\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g) || [];
+    concepts.push(...keywords.filter(k => k.length > 3));
+    
+    // Extract quoted or bracketed terms
+    const quoted = text.match(/"([^"]+)"/g) || [];
+    concepts.push(...quoted.map(q => q.replace(/"/g, '')));
+    
+    // Update graph
+    concepts.forEach(concept => {
+      setKnowledgeGraph(prev => {
+        const existing = prev.find(k => k.concept === concept);
+        if (existing) {
+          return prev.map(k => 
+            k.concept === concept 
+              ? { 
+                  ...k, 
+                  relatedThreads: k.relatedThreads.includes(threadId) ? k.relatedThreads : [...k.relatedThreads, threadId],
+                  mentions: k.mentions + 1,
+                  lastSeen: Date.now()
+                }
+              : k
+          );
+        } else {
+          return [...prev, {
+            concept,
+            relatedThreads: [threadId],
+            mentions: 1,
+            lastSeen: Date.now()
+          }];
+        }
+      });
+    });
+  }
+
+  // Auto-extract protocol expressions from AI responses
+  function extractProtocolsFromText(text: string, threadId: string) {
+    const protocolPatterns = [
+      /([Φπελ][Δ→:][\w\[\]\/=:]+)/g,  // Patterns like Φ:Δ, Φπε:Τ/Ρ
+      /([ΛΔΩΨΞΓΣ][→+:\/\[\]= ]+[ΦπεΛΔΩΨΞΓΣζλωΤΡδΘχn]+)/g,  // Complex expressions
+      /\[[\w\sΦπεΛΔΩΨΞΓΣζλωΤΡδΘχ→+:\/\[\]= ]+\]/g,  // Bracketed expressions
+    ];
+
+    const found: string[] = [];
+    protocolPatterns.forEach(pattern => {
+      const matches = text.match(pattern);
+      if (matches) {
+        matches.forEach(m => {
+          if (m.length > 2 && !found.includes(m)) {
+            found.push(m);
+          }
+        });
+      }
+    });
+
+    // Extract and save unique protocol expressions
+    found.forEach(expr => {
+      // Look for explanation in surrounding text
+      const idx = text.indexOf(expr);
+      const contextStart = Math.max(0, idx - 50);
+      const contextEnd = Math.min(text.length, idx + expr.length + 100);
+      const context = text.substring(contextStart, contextEnd);
+      
+      const id = `proto-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+      setExtractedProtocols(prev => {
+        // Avoid duplicates
+        if (prev.some(p => p.expression === expr)) return prev;
+        return [...prev, {
+          id,
+          expression: expr,
+          explanation: context,
+          timestamp: Date.now(),
+          threadId
+        }];
+      });
+    });
+  }
+
+  // Semantic Search across all content
+  function performSearch(query: string) {
+    if (!query.trim()) {
+      setSearchResults([]);
+      return;
+    }
+
+    const q = query.toLowerCase();
+    const results: {type: "thread" | "block" | "pdf"; id: string; text: string; score: number; threadTitle?: string}[] = [];
+
+    // Search threads and messages
+    threads.forEach(thread => {
+      thread.messages.forEach(msg => {
+        if (msg.text.toLowerCase().includes(q)) {
+          const score = (msg.text.toLowerCase().match(new RegExp(q, 'g')) || []).length;
+          results.push({
+            type: "thread",
+            id: thread.id,
+            text: msg.text.substring(0, 200) + (msg.text.length > 200 ? "..." : ""),
+            score,
+            threadTitle: thread.title
+          });
+        }
+      });
+    });
+
+    // Search context blocks across all threads
+    threads.forEach(thread => {
+      (thread.contextBlocks || []).forEach(block => {
+        if (block.text.toLowerCase().includes(q)) {
+          const score = (block.text.toLowerCase().match(new RegExp(q, 'g')) || []).length;
+          results.push({
+            type: "block",
+            id: block.id,
+            text: block.text.substring(0, 200) + (block.text.length > 200 ? "..." : ""),
+            score,
+            threadTitle: thread.title
+          });
+        }
+      });
+    });
+
+    // Search PDF nodes
+    pdfNodes.forEach(pdf => {
+      if (pdf.name.toLowerCase().includes(q) || pdf.path.toLowerCase().includes(q)) {
+        const score = (pdf.name.toLowerCase().match(new RegExp(q, 'g')) || []).length + 1;
+        results.push({
+          type: "pdf",
+          id: pdf.id,
+          text: pdf.name,
+          score
+        });
+      }
+    });
+
+    // Sort by score descending
+    results.sort((a, b) => b.score - a.score);
+    setSearchResults(results.slice(0, 50)); // Top 50 results
+  }
+
+  // Context reservoir helpers (MVP)
+  const activeContextBlocks = activeThread?.contextBlocks || [];
+
+  function setActiveThreadContextBlocks(mutator: (blocks: ContextBlock[]) => ContextBlock[]) {
+    if (!activeThreadId) return;
+    setThreads(prev => prev.map(t => t.id === activeThreadId ? { ...t, contextBlocks: mutator(t.contextBlocks || []) } : t));
+  }
+
+  // Smart relevance scoring for context blocks
+  function calculateRelevanceScore(block: ContextBlock, promptText: string): number {
+    let score = 0;
+    const promptLower = promptText.toLowerCase();
+    const blockLower = block.text.toLowerCase();
+    
+    // Keyword matching
+    const promptWords = promptLower.split(/\s+/).filter(w => w.length > 3);
+    promptWords.forEach(word => {
+      const matches = (blockLower.match(new RegExp(word, 'g')) || []).length;
+      score += matches * 2;
+    });
+    
+    // Tag matching
+    if (block.tags) {
+      block.tags.forEach(tag => {
+        if (promptLower.includes(tag)) score += 5;
+      });
+    }
+    
+    // Protocol symbol matching
+    const protocolSymbols = ['Φ', 'π', 'ε', 'Λ', 'Δ', 'Ω', 'Ψ', 'Ξ', 'Γ', 'Σ', 'ζ', 'λ', 'ω', 'Τ', 'Ρ', 'δ', 'Θ', 'χ'];
+    protocolSymbols.forEach(sym => {
+      if (promptText.includes(sym) && block.text.includes(sym)) {
+        score += 10;
+      }
+    });
+    
+    // Recency bonus (newer blocks get slight boost)
+    const ageInDays = (Date.now() - block.createdAt) / (1000 * 60 * 60 * 24);
+    if (ageInDays < 1) score += 3;
+    else if (ageInDays < 7) score += 1;
+    
+    // Attention score bonus
+    score += block.attention * 5;
+    
+    // Pinned blocks always rank high
+    if (block.pinned) score += 100;
+    
+    return score;
+  }
+
+  // Auto-generate tags for context blocks
+  function autoGenerateTags(text: string): string[] {
+    const tags: string[] = [];
+    
+    // Protocol symbols
+    if (/[ΦπεΛΔΩΨΞΓΣζλωΤΡδΘχ]/.test(text)) tags.push("protocol");
+    if (/Φ/.test(text)) tags.push("phi");
+    if (/Δ/.test(text)) tags.push("delta");
+    if (/Λ/.test(text)) tags.push("lambda");
+    
+    // Concepts
+    if (/(harmonic|resonance|frequency)/i.test(text)) tags.push("harmonics");
+    if (/(recursion|recursive|loop|cycle)/i.test(text)) tags.push("recursion");
+    if (/(memory|remember|recall)/i.test(text)) tags.push("memory");
+    if (/(structure|pattern|architecture)/i.test(text)) tags.push("structure");
+    if (/(energy|potential|force)/i.test(text)) tags.push("energy");
+    if (/(consciousness|awareness|perception)/i.test(text)) tags.push("consciousness");
+    if (/(quantum|entangle|superposition)/i.test(text)) tags.push("quantum");
+    if (/(intelligence|ai|neural|cognitive)/i.test(text)) tags.push("intelligence");
+    
+    // Math/Science
+    if (/(equation|formula|calculate|math)/i.test(text)) tags.push("math");
+    if (/(physics|quantum|particle)/i.test(text)) tags.push("physics");
+    
+    // Source-based
+    if (text.length > 5000) tags.push("long-form");
+    if (text.length < 200) tags.push("short");
+    
+    return [...new Set(tags)]; // Remove duplicates
+  }
+
+  function addContextBlockFromText(text: string, mode: MemoryMode, source: ContextBlock["source"], customId?: string) {
+    const trimmed = text.trim();
+    if (!trimmed || !activeThreadId) return;
+    const now = Date.now();
+    const block: ContextBlock = {
+      id: customId || mkBlockId(),
+      text: trimmed,
+      source,
+      createdAt: now,
+      lastUsedAt: null,
+      attention: 0.5,
+      state: "active",
+      mode,
+      tags: autoGenerateTags(trimmed), // Auto-generate tags
+      pinned: false,
+    };
+    setActiveThreadContextBlocks((prev) => [block, ...prev]);
+  }
+
+  function createManualBlock() {
+    const text = window.prompt("New context block text:");
+    if (!text) return;
+    addContextBlockFromText(text, "phi", "manual");
+  }
+
+  function addBlockFromLastAssistant() {
+    if (!messages.length) return;
+    const lastAssistant = [...messages].reverse().find((m) => m.role === "assistant");
+    if (!lastAssistant) return;
+    addContextBlockFromText(lastAssistant.text, "delta", "chat");
+  }
+
+  function addBlockFromPdfContext() {
+    if (!docContext) return;
+    addContextBlockFromText(docContext, "phi", "pdf");
+  }
+
+  function toggleBlockMode(id: string) {
+    setActiveThreadContextBlocks((prev) => prev.map((b) => {
+      if (b.id !== id) return b;
+      const nextMode: MemoryMode = b.mode === "phi" ? "delta" : b.mode === "delta" ? "lambda" : "phi";
+      return { ...b, mode: nextMode };
+    }));
+  }
+
+  function toggleBlockPinned(id: string) {
+    setActiveThreadContextBlocks((prev) => prev.map((b) => b.id === id ? { ...b, pinned: !b.pinned } : b));
+  }
+
+  function deleteBlock(id: string) {
+    setActiveThreadContextBlocks((prev) => prev.filter((b) => b.id !== id));
+  }
+
+  // RPO ingestion helpers: detect protocol wrappers in assistant text and persist as RecursiveProtocolObject
+  async function ingestProtocolIfPresent(text: string) {
+    const rpoMatch = text.match(/Ξ-PROTOCOL\s*{[\s\S]*?}/) || text.match(/BEGIN_RPO[\s\S]*?END_RPO/);
+    if (!rpoMatch) return;
+    const block = rpoMatch[0];
+    try {
+      const proto = await invoke<RecursiveProtocolObject>("parse_protocol_from_text", { text: block });
+      await invoke("save_protocol", { proto });
+      const list = await invoke<RecursiveProtocolObject[]>("list_protocols");
+      setProtocols(list || []);
+    } catch {
+      // best-effort; ignore failures
+    }
+  }
+
+  async function stopGeneration() {
+    try {
+      if (currentStream) {
+        await invoke("cancel_stream", { stream_id: currentStream.id, backend: currentStream.backend });
+      }
+    } catch {}
+    setLoading(false);
+    setCurrentStream(null);
+    if (unlistenRef.current) { unlistenRef.current(); unlistenRef.current = null; }
+  }
+
+  function lastUserMessage(): Msg | null {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === "user") return messages[i];
+    }
+    return null;
+  }
+
+  function retryLast() {
+    const last = lastUserMessage();
+    if (!last) return;
+    setPrompt(last.text);
+    void send();
+  }
+
+  function editAndResend() {
+    const last = lastUserMessage();
+    if (!last) return;
+    setPrompt(last.text);
+    const el = promptRef.current;
+    requestAnimationFrame(() => { el?.focus(); el?.setSelectionRange(last.text.length, last.text.length); });
+  }
+
+  async function send() {
+    if (!activeThread) return; // Safety check
+    
+    // Smart greeting detection - only intercept pure greetings, everything else goes to the model
+    const trimmedPrompt = prompt.trim().toLowerCase();
+    const bare = trimmedPrompt.replace(/[!?.]+$/g, "");
+
+    const greetings = ["hello", "hi", "hey", "howdy", "greetings", "sup", "yo", "hiya"];    
+    const isSimpleGreeting = greetings.includes(bare);
+
+    const localReply = (() => {
+      if (isSimpleGreeting) {
+        const greetingResponses = [
+          "Hello! How can I help you today?",
+          "Hi there! What can I do for you?",
+          "Hey! What would you like to work on?",
+          "Hello! Feel free to ask me anything.",
+          "Hi! Ready when you are."
+        ];
+        return greetingResponses[Math.floor(Math.random() * greetingResponses.length)];
+      }
+      return null;
+    })();
+
+    if (localReply) {
+      const userId = mkStreamId();
+      const assistantId = mkStreamId();
+
+      // Add user message and AI local response
+      const userMsg: Msg = { id: userId, role: "user", text: prompt };
+      const aiMsg: Msg = { id: assistantId, role: "assistant", text: localReply };
+      
+      const updatedThread: Thread = {
+        id: activeThread.id,
+        title: activeThread.title,
+        createdAt: activeThread.createdAt,
+        contextBlocks: activeThread.contextBlocks,
+        messages: [...messages, userMsg, aiMsg]
+      };
+      
+      setThreads((prev) => prev.map((t) => (t.id === updatedThread.id ? updatedThread : t)));
+      setPrompt("");
+      return; // Skip model call
+    }
+
+    setLoading(true);
+    setError(null);
+    const streamId = mkStreamId();
+    const topic = useRi1 ? `ri1://${streamId}` : `ollama://${streamId}`;
+    setCurrentStream({ id: streamId, backend: useRi1 ? "ri1" : "ollama" });
+    const userId = mkStreamId();
+    const assistantId = mkStreamId();
+    let assistantText = "";
+    // Construct prompt using Context Reservoir and optional document context
+    const rawPhi = activeContextBlocks.filter((b) => b.mode === "phi");
+    const rawDelta = activeContextBlocks.filter((b) => b.mode === "delta");
+    const lambdaBlocks = activeContextBlocks.filter((b) => b.mode === "lambda");
+
+    // For huge PDFs: include all non-PDF Φ/Δ, but only a bounded set of PDF chunks
+    const nonPdfPhi = rawPhi.filter((b) => b.source !== "pdf");
+    const nonPdfDelta = rawDelta.filter((b) => b.source !== "pdf");
+    const pdfPhi = rawPhi.filter((b) => b.source === "pdf");
+    const pdfDelta = rawDelta.filter((b) => b.source === "pdf");
+
+    // Smart prioritization: rank by relevance to current prompt
+    const MAX_PDF_BLOCKS = 8;
+    const sortedPdfPhi = pdfPhi
+      .map(b => ({ block: b, score: calculateRelevanceScore(b, prompt) }))
+      .sort((a, b) => b.score - a.score)
+      .map(x => x.block);
+    const sortedPdfDelta = pdfDelta
+      .map(b => ({ block: b, score: calculateRelevanceScore(b, prompt) }))
+      .sort((a, b) => b.score - a.score)
+      .map(x => x.block);
+    const selectedPdfPhi: typeof pdfPhi = [];
+    const selectedPdfDelta: typeof pdfDelta = [];
+    for (const b of sortedPdfPhi) {
+      if (selectedPdfPhi.length + selectedPdfDelta.length >= MAX_PDF_BLOCKS) break;
+      selectedPdfPhi.push(b);
+    }
+    for (const b of sortedPdfDelta) {
+      if (selectedPdfPhi.length + selectedPdfDelta.length >= MAX_PDF_BLOCKS) break;
+      selectedPdfDelta.push(b);
+    }
+
+    const phiBlocks = [...nonPdfPhi, ...selectedPdfPhi];
+    const deltaBlocks = [...nonPdfDelta, ...selectedPdfDelta];
+
+    // RI1 Protocol System Instruction with learned preferences
+    let ri1ProtocolInstruction = "";
+    if (useRi1) {
+      ri1ProtocolInstruction = `[RI1 PROTOCOL]: Recognize and respect all RI1 canon symbols and operators:
+Greek: Φ π ε Λ Δ Ω Ψ Ξ Γ Σ ζ λ ω Τ Ρ δ Θ χ
+Operators: → + : / | [] = n
+When the user uses these symbols, interpret them according to RI1 protocol semantics.
+
+[ROLES]: You are the assistant. You write replies and perform reasoning. The person using RI1 Desktop is the user. Never talk as if the user is the assistant or that you are asking them to provide assistance.`;
+
+      // Coder mode guidance lives in the system layer so it behaves like a backend instruction
+      if (coderMode) {
+        ri1ProtocolInstruction += `
+
+[CODER MODE]: Assume the user is working in an IDE (such as Windsurf) with a codebase open. Prefer concrete code edits, diffs, and file-scoped changes over generic explanations. When proposing changes, mention filenames and show only the minimal necessary snippets instead of entire files.`;
+      }
+
+      ri1ProtocolInstruction += `\n\n`;
+      
+      // Add learned user preferences
+      if (userPreferences.correctionsCount > 3) {
+        ri1ProtocolInstruction += `[USER PREFERENCES]: `;
+        if (userPreferences.preferredLength === "short") ri1ProtocolInstruction += `Keep responses concise. `;
+        else if (userPreferences.preferredLength === "long") ri1ProtocolInstruction += `Provide detailed, comprehensive responses. `;
+        if (userPreferences.preferredStyle === "technical") ri1ProtocolInstruction += `Use technical, precise language. `;
+        else if (userPreferences.preferredStyle === "conversational") ri1ProtocolInstruction += `Use conversational, accessible language. `;
+        ri1ProtocolInstruction += `\n\n`;
+      }
+    }
+
+    const sections: string[] = [];
+    if (lambdaBlocks.length) {
+      sections.push([
+        "Λ (System instructions):",
+        ...lambdaBlocks.map((b) => `- ${b.text}`),
+      ].join("\n"));
+    }
+    if (phiBlocks.length) {
+      sections.push([
+        "Φ (Persistent context):",
+        "---",
+        ...phiBlocks.map((b) => b.text),
+        "---",
+      ].join("\n"));
+    }
+    if (deltaBlocks.length) {
+      sections.push([
+        "Δ (Additional context):",
+        "---",
+        ...deltaBlocks.map((b) => b.text),
+        "---",
+      ].join("\n"));
+    }
+    if (docContext) {
+      sections.push(["Document context:", docContext].join("\n"));
+    }
+    // RI1 Basin: look up passages from Andrew's documents and hand them to the model with citations
+    let basinUsed: BasinHit[] = [];
+    if (useBasin && prompt.trim()) {
+      try {
+        const r = await invoke<{ hits: BasinHit[]; dir: string; curated: number; raw: number }>("basin_search", { query: prompt, k: 6 });
+        basinUsed = r.hits;
+        setBasinNote(r.hits.length ? "" : `No Basin passage matched this message (searched ${r.curated} curated + ${r.raw} raw passages in ${r.dir}).`);
+        if (r.hits.length) {
+          sections.push([
+            "RI1 Basin passages (verbatim from Andrew's RI1 documents; cite them as [B1], [B2] …):",
+            ...r.hits.map((h, i) => `[B${i + 1}] ${basinTitle(h)} — page ${h.page}${h.heading ? ` — ${h.heading}` : ""}\n${h.text}`),
+            "Use these passages where they bear on the request and cite them by number. If they do not contain the answer, say the provided documents don't state it, then answer from general knowledge and label it as general knowledge. Do not invent details the passages do not contain.",
+          ].join("\n\n"));
+        }
+      } catch (e: any) {
+        setBasinNote(`Basin unavailable: ${e?.toString?.() ?? e}`);
+      }
+    } else {
+      setBasinNote("");
+    }
+    setBasinHits(basinUsed);
+
+    const prefix = sections.length ? sections.join("\n\n") + "\n\n" : "";
+    // No "User:" label: the chat API already marks this as the user's turn, and a
+    // transcript-style label invites the model to keep writing both sides.
+    const fullPrompt = `${ri1ProtocolInstruction}${prefix}${prefix || ri1ProtocolInstruction ? "Request:\n" : ""}${prompt}`;
+
+    // Bump attention for any blocks used in this send
+    if (activeContextBlocks.length) {
+      const now = Date.now();
+      setActiveThreadContextBlocks((prev) => prev.map((b) => {
+        const used = phiBlocks.includes(b) || deltaBlocks.includes(b) || lambdaBlocks.includes(b);
+        if (!used) return b;
+        const nextAttention = Math.min(1, (b.attention ?? 0) + 0.3);
+        return { ...b, attention: nextAttention, lastUsedAt: now, state: "active" };
+      }));
+    }
+    // Add user message (store raw text + full assembled prompt)
+    updateActiveThreadMessages((prev) => [...prev, { id: userId, role: "user", text: prompt, fullPrompt }]);
+    // Add empty assistant message placeholder with model tracking
+    updateActiveThreadMessages((prev) => [...prev, { id: assistantId, role: "assistant", text: "", model, backend: useRi1 ? "ri1" : "ollama" }]);
+    try {
+      // Listen for stream chunks
+      unlistenRef.current = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
+        const { chunk, done } = e.payload as any;
+        if (chunk) {
+          // Filter out RI1 metadata and stderr
+          if (chunk.startsWith('[err]')) {
+            setLogs((prev) => prev ? prev + "\n" + chunk : chunk);
+            return; // Don't add to message
+          }
+          
+          // Filter out RI1 internal metadata
+          if (chunk.startsWith('---') || 
+              chunk.startsWith('{') && chunk.includes('"correlation_id"') ||
+              chunk.includes('--- constraints ---') ||
+              chunk.includes('InteractionNotice:') ||
+              chunk.includes('? [-]') ||
+              chunk.includes('[-]') ||
+              chunk.trim().startsWith('?') && chunk.includes('InteractionNotice') ||
+              chunk.match(/^\s*\[-\]/) ||
+              chunk.match(/^(non_empty|max_length|min_length|exact_length)\s*\[/) ||
+              chunk.trim().startsWith('non_empty') ||
+              chunk.trim().startsWith('max_length')) {
+            return; // Skip metadata
+          }
+          
+          // Add actual content
+          assistantText += chunk;
+          updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: m.text + chunk } : m)));
+        }
+        if (done) {
+          setLoading(false);
+          if (unlistenRef.current) {
+            unlistenRef.current();
+            unlistenRef.current = null;
+          }
+          setCurrentStream(null);
+          setPrompt("");
+          void ingestProtocolIfPresent(assistantText);
+          // Auto-extract protocol expressions from response
+          if (useRi1 && assistantText) {
+            extractProtocolsFromText(assistantText, activeThreadId);
+            updateKnowledgeGraph(assistantText, activeThreadId);
+          }
+          // Auto-TTS if enabled
+          if (ttsEnabled && assistantText) {
+            speakText(assistantText, assistantId);
+          }
+        }
+      });
+      // Kick off streaming on backend
+      if (useRi1) {
+        // Ensure ri1-8b is used with RI1 for symbolic operations
+        const ri1Model = model || "ri1-llama:desktop";
+        console.log("RI1 Engine using model:", ri1Model);
+        await invoke("gen_ri1_stream", { prompt: fullPrompt, model: ri1Model, ri1CliPath: settings.ri1CliPath || undefined, ollamaEndpoint: settings.ollamaEndpoint || undefined, streamId, verbose });
+      } else {
+        await invoke("gen_ollama_stream", { prompt: fullPrompt, model, streamId });
+      }
+    } catch (e: any) {
+      // Fallback to non-streaming
+      try {
+        const fallbackModel = model || "ri1-llama:desktop";
+        const out = await invoke<string>(useRi1 ? "gen_ri1_stream" : "gen_ollama", useRi1 ? { prompt: fullPrompt, model: fallbackModel, ri1CliPath: settings.ri1CliPath || undefined, streamId: mkStreamId() } : { prompt: fullPrompt, model: fallbackModel });
+        updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: out } : m)));
+        void ingestProtocolIfPresent(out);
+      } catch (ee: any) {
+        setError(ee?.toString?.() ?? e?.toString?.() ?? "Unknown error");
+      } finally {
+        setLoading(false);
+        if (unlistenRef.current) {
+          unlistenRef.current();
+          unlistenRef.current = null;
+        }
+        setCurrentStream(null);
+        setPrompt("");
+      }
+    }
+  }
+
+  async function runKosmos(e?: React.FormEvent) {
+    if (e) e.preventDefault();
+    setKRunning(true);
+    setKOutput("");
+    setKParsed(null);
+    const id = mkStreamId();
+    const topic = `kosmos://${id}`;
+
+    // Optionally include Context Reservoir and PDF context in Kosmos prompt
+    let kosmosPrompt = kPrompt;
+    if (kUseReservoir) {
+      const phiBlocks = activeContextBlocks.filter((b) => b.mode === "phi");
+      const deltaBlocks = activeContextBlocks.filter((b) => b.mode === "delta");
+      const lambdaBlocks = activeContextBlocks.filter((b) => b.mode === "lambda");
+
+      const sections: string[] = [];
+      if (lambdaBlocks.length) {
+        sections.push([
+          "System instructions:",
+          ...lambdaBlocks.map((b) => `- ${b.text}`),
+        ].join("\n"));
+      }
+      if (phiBlocks.length) {
+        sections.push([
+          "Persistent context for this research thread:",
+          "---",
+          ...phiBlocks.map((b) => b.text),
+          "---",
+        ].join("\n"));
+      }
+      if (deltaBlocks.length) {
+        sections.push([
+          "Additional context for this research step:",
+          "---",
+          ...deltaBlocks.map((b) => b.text),
+          "---",
+        ].join("\n"));
+      }
+      if (docContext) {
+        sections.push(["Document context:", docContext].join("\n"));
+      }
+      const prefix = sections.length ? sections.join("\n\n") + "\n\n" : "";
+      kosmosPrompt = `${prefix}${kPrompt}`;
+    }
+    try {
+      kUnlistenRef.current = await listen<{ chunk: string; done: boolean }>(topic, (ev) => {
+        const { chunk, done } = ev.payload as any;
+        if (chunk) setKOutput((prev) => (prev ? prev + "\n" + chunk : chunk));
+        if (done) {
+          setKRunning(false);
+          if (kUnlistenRef.current) { kUnlistenRef.current(); kUnlistenRef.current = null; }
+          // Try to parse JSON from accumulated output
+          try {
+            const raw = (prev => prev)(kOutput);
+            const start = raw.indexOf('{');
+            const end = raw.lastIndexOf('}');
+            if (start >= 0 && end > start) {
+              const slice = raw.slice(start, end + 1);
+              const obj = JSON.parse(slice);
+              setKParsed(obj);
+            }
+          } catch {}
+        }
+      });
+      await invoke("run_kosmos_stream", {
+        app: undefined,
+        topic: id,
+        offline: kOffline,
+        emitRaw: kEmitRaw,
+        ollamaModel: kModel,
+        prompt: kosmosPrompt,
+        ri1CliPath: settings.ri1CliPath || undefined,
+        kosmosPath: settings.kosmosPath || undefined,
+      });
+    } catch (e: any) {
+      setKRunning(false);
+      if (kUnlistenRef.current) { kUnlistenRef.current(); kUnlistenRef.current = null; }
+      setError(e?.toString?.() ?? "Kosmos run failed");
+    }
+  }
+
+  function exportJson() {
+    const data = { model, thread: activeThread };
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ri1-chat-${Date.now()}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function exportTxt() {
+    const lines = messages.map((m) => `${m.role.toUpperCase()}\n${m.text}\n`);
+    const blob = new Blob([lines.join("\n")], { type: "text/plain" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `ri1-chat-${Date.now()}.txt`;
+    a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  const isTiny = windowWidth < 700;
+  const baseFont = compactMode ? 13 : 14;
+  const basePad = compactMode ? 6 : 8;
+
+  const appContext: AppContext = {
+    activeThreadId: activeThreadId || null,
+  };
+
+  return (
+    <>
+      <CommandPalette
+        open={commandPaletteOpen}
+        onClose={() => setCommandPaletteOpen(false)}
+        appContext={appContext}
+      />
+      <main className="container" style={{ gap: 16, display: "flex", flexDirection: "row", alignItems: "flex-start", maxWidth: 980, margin: "0 auto", fontSize: baseFont }}>
+      {/* Sidebar */}
+      {!sidebarCollapsed && (
+      <aside style={{ width: 220, padding: 12, position: "sticky", top: 0 }}>
+        <h2 style={{ marginTop: 0, color: "#b8860b" }}>Threads</h2>
+        <div className="row" style={{ gap: 8, justifyContent: "flex-start" }}>
+          <button onClick={newThread}>New</button>
+          <button onClick={() => activeThreadId && renameThread(activeThreadId)} disabled={!activeThreadId}>Rename</button>
+          <button onClick={() => activeThreadId && deleteThread(activeThreadId)} disabled={!activeThreadId}>Delete</button>
+        </div>
+        <div style={{ marginTop: 12, display: "flex", flexDirection: "column", gap: 6, maxHeight: 480, overflowY: "auto" }}>
+          {threads.map(t => (
+            <div key={t.id} style={{ display: "flex", gap: 6 }}>
+              {editingThreadId === t.id ? (
+                <>
+                  <input
+                    value={editingTitle}
+                    onChange={(e) => setEditingTitle(e.currentTarget.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') { e.preventDefault(); commitRename(t.id, editingTitle); }
+                      else if (e.key === 'Escape') { e.preventDefault(); cancelRename(); }
+                    }}
+                    style={{ flex: 1 }}
+                  />
+                  <button onClick={() => commitRename(t.id, editingTitle)} disabled={!editingTitle.trim()}>Save</button>
+                  <button onClick={cancelRename}>Cancel</button>
+                </>
+              ) : (
+                <button onClick={() => setActiveThreadId(t.id)} style={{
+                  textAlign: "left", background: t.id===activeThreadId?"#b8860b":"#3b1a6e", color: t.id===activeThreadId?"#0b0b0b":"#e9d5ff", flex: 1
+                }}>
+                  {t.title}
+                </button>
+              )}
+      {fullPromptModalOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setFullPromptModalOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: "#0b0b0b", border: "1px solid #333", borderRadius: 8, padding: 16, minWidth: 420, maxWidth: 720 }}>
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>Full prompt</h3>
+            <pre style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{fullPromptModalText}</pre>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12, gap: 8 }}>
+              <button type="button" onClick={() => navigator.clipboard.writeText(fullPromptModalText || "")}>Copy</button>
+              <button type="button" onClick={() => setFullPromptModalOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+            </div>
+          ))}
+        </div>
+      </aside>
+      )}
+      {modelInfoOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setModelInfoOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: "#0b0b0b", border: "1px solid #333", borderRadius: 8, padding: 16, minWidth: 420, maxWidth: 720 }}>
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>Model info: {model}</h3>
+            <pre style={{ maxHeight: 420, overflow: "auto", whiteSpace: "pre-wrap" }}>{modelInfoText}</pre>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+              <button onClick={() => setModelInfoOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Main content */}
+      <div style={{ flex: 1 }}>
+      <h1 style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 8 }}>
+          <span className="app-title">RI1 Desktop</span>
+          <button
+            type="button"
+            onClick={() => setTab("guide")}
+            style={{
+              fontSize: 11,
+              padding: "2px 8px",
+              borderRadius: 999,
+              background: "transparent",
+              border: "1px solid rgba(148,163,184,0.5)",
+              color: "var(--text-secondary)",
+              boxShadow: "none"
+            }}
+          >
+            Start here
+          </button>
+        </div>
+        <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+          <button onClick={() => setSidebarCollapsed(!sidebarCollapsed)} style={{ fontSize: 12 }}>
+            {sidebarCollapsed ? "Show Threads" : "Hide Threads"}
+          </button>
+          <label style={{ fontSize: 11, display: "flex", alignItems: "center", gap: 4, opacity: 0.7 }}>
+            <input 
+              type="checkbox" 
+              checked={autoCompact} 
+              onChange={(e) => setAutoCompact(e.target.checked)}
+            />
+            Auto-compact
+          </label>
+        </div>
+      </h1>
+      <div className="row" style={{ gap: 8, flexWrap: "wrap", alignItems: "center" }}>
+        <button onClick={() => setTab("chat")} disabled={tab === "chat"}>Chat</button>
+        <button onClick={() => setTab("kosmos")} disabled={tab === "kosmos"}>Kosmos</button>
+        <button onClick={() => setTab("library")} disabled={tab === "library"}>Library</button>
+        <button onClick={() => setTab("parser")} disabled={tab === "parser"}>Parser</button>
+        <button onClick={() => setTab("search")} disabled={tab === "search"}>Search</button>
+        <button onClick={() => setTab("graph")} disabled={tab === "graph"}>Graph</button>
+        <button onClick={() => setTab("analytics")} disabled={tab === "analytics"}>Analytics</button>
+        <button onClick={() => setTab("compare")} disabled={tab === "compare"}>Compare</button>
+        <button onClick={() => setTab("coder")} disabled={tab === "coder"}>Coder</button>
+        <button onClick={() => setTab("guide")} disabled={tab === "guide"}>Guide</button>
+        <button onClick={() => setTab("settings")} disabled={tab === "settings"}>
+          Settings {plugins.filter(p => p.enabled).length > 0 && <span style={{ fontSize: 10 }}>🔌{plugins.filter(p => p.enabled).length}</span>}
+        </button>
+        <button onClick={() => setTab("crm")} disabled={tab === "crm"}>CRM</button>
+        <button onClick={() => setTab("workshop")} disabled={tab === "workshop"}>Workshop</button>
+        {tab === "chat" && (
+          <>
+            <button 
+              onClick={() => {
+                const options = [
+                  { name: "JSON", fn: exportJson },
+                  { name: "TXT", fn: exportTxt },
+                  { name: "Markdown", fn: () => {
+                    const md = messages.map(m => `## ${m.role === "user" ? "You" : "AI"}\n\n${m.text}\n\n---\n`).join("\n");
+                    const blob = new Blob([md], { type: "text/markdown" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${activeThread?.title || "thread"}.md`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }},
+                  { name: "HTML", fn: () => {
+                    const html = `<!DOCTYPE html>
+<html><head><title>${activeThread?.title || "Thread"}</title>
+<style>body{font-family:sans-serif;max-width:800px;margin:40px auto;padding:20px;background:#0b0b0b;color:#e0e0e0;}
+.msg{margin:20px 0;padding:15px;border-radius:8px;}.user{background:#1a4d2e;}.ai{background:#2a1a4a;}</style>
+</head><body><h1>${activeThread?.title || "Thread"}</h1>
+${messages.map(m => `<div class="msg ${m.role}"<strong>${m.role === "user" ? "You" : "AI"}:</strong><p>${m.text.replace(/\n/g, "<br>")}</p></div>`).join("\n")}
+</body></html>`;
+                    const blob = new Blob([html], { type: "text/html" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${activeThread?.title || "thread"}.html`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }},
+                  { name: "CSV", fn: () => {
+                    const csv = "Role,Text,Timestamp\n" + messages.map(m => 
+                      `"${m.role}","${m.text.replace(/"/g, '""')}","${new Date().toISOString()}"`
+                    ).join("\n");
+                    const blob = new Blob([csv], { type: "text/csv" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${activeThread?.title || "thread"}.csv`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  }}
+                ];
+                const choice = window.prompt(`Export as:\n${options.map((o, i) => `${i+1}. ${o.name}`).join("\n")}\n\nEnter number (1-${options.length}):`, "1");
+                const idx = parseInt(choice || "1") - 1;
+                if (idx >= 0 && idx < options.length) options[idx].fn();
+              }}
+              style={{ flex: "0 0 auto" }}
+            >
+              📥 Export
+            </button>
+            <button onClick={clearActiveThread} title="Clear this thread" style={{ flex: "0 0 auto" }}>Clear</button>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input type="checkbox" checked={useRi1} onChange={(e) => setUseRi1(e.currentTarget.checked)} /> 
+              Use RI1 engine {useRi1 && <span style={{ fontSize: 11, opacity: 0.7 }}>→ {model || "sotma-phishell"}</span>}
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input type="checkbox" checked={showSymbols} onChange={(e) => setShowSymbols(e.currentTarget.checked)} /> Symbols
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }} title="Look up passages in your RI1 Basin and give them to the model with citations">
+              <input type="checkbox" checked={useBasin} onChange={(e) => setUseBasin(e.currentTarget.checked)} /> Basin
+            </label>
+            {useBasin && (basinHits.length > 0 || basinNote) && (
+              <details style={{ position: "relative", flex: "0 0 auto" }}>
+                <summary style={{ cursor: "pointer" }}>Sources ({basinHits.length})</summary>
+                <div style={{ position: "absolute", zIndex: 50, right: 0, top: "1.6em", width: 460, maxHeight: 420, overflow: "auto", background: "#111", border: "1px solid #333", borderRadius: 8, padding: 10, fontSize: 12 }}>
+                  {basinNote && <div style={{ opacity: 0.8 }}>{basinNote}</div>}
+                  {basinHits.map((h, i) => (
+                    <div key={h.id} style={{ borderTop: i ? "1px solid #2a2a2a" : "none", padding: "6px 0" }}>
+                      <div><strong>[B{i + 1}] {basinTitle(h)}</strong> — p.{h.page} <span style={{ opacity: 0.6 }}>{h.tier === "T1" ? "curated" : "raw chunk"}</span></div>
+                      {h.heading && <div style={{ opacity: 0.7 }}>{h.heading}</div>}
+                      <div style={{ whiteSpace: "pre-wrap", opacity: 0.85, marginTop: 4 }}>{h.text.length > 500 ? h.text.slice(0, 500) + "…" : h.text}</div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            )}
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input type="checkbox" checked={verbose} onChange={(e) => setVerbose(e.currentTarget.checked)} /> Verbose
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input
+                type="checkbox"
+                checked={coderMode}
+                onChange={(e) => setCoderMode(e.currentTarget.checked)}
+              />
+              Coder mode
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input type="checkbox" checked={ttsEnabled} onChange={(e) => setTtsEnabled(e.currentTarget.checked)} /> 🔊 Auto-TTS
+            </label>
+            {ttsEnabled && (
+              <div style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto", fontSize: 11 }}>
+                Speed:
+                <input 
+                  type="range" 
+                  min="0.5" 
+                  max="2" 
+                  step="0.1" 
+                  value={ttsSpeed} 
+                  onChange={(e) => setTtsSpeed(parseFloat(e.target.value))}
+                  style={{ width: 60 }}
+                />
+                <span>{ttsSpeed.toFixed(1)}x</span>
+              </div>
+            )}
+            <span style={{ marginLeft: 8, padding: "2px 6px", borderRadius: 6, fontSize: 12, background: daemonRunning ? "#1b4332" : "#641e16", flex: "0 0 auto" }}>
+              {daemonRunning === null ? "checking…" : daemonRunning ? "daemon: up" : "daemon: down"}
+            </span>
+            <button onClick={() => void refreshModelsAndHealth()} title="Refresh models" style={{ flex: "0 0 auto" }}>Refresh</button>
+            <button onClick={async () => {
+              try {
+                const info = await invoke<{ modelfile: string; parameters: any }>("ollama_show", { model, endpoint: settings.ollamaEndpoint || undefined });
+                const mf = (info as any).modelfile || "";
+                // Extract FROM line
+                const from = (mf.match(/^FROM\s+.+$/m) || [""])[0];
+                setModelInfoText([from, "", mf].filter(Boolean).join("\n"));
+                setModelInfoOpen(true);
+              } catch (e: any) {
+                setError(e?.toString?.() ?? "Failed to fetch model info");
+              }
+            }} style={{ flex: "0 0 auto" }}>Model info</button>
+            <div style={{ flex: "1 1 200px" }} />
+            <label style={{ display: "flex", alignItems: "center", gap: 6, flex: "0 0 auto" }}>
+              <input type="checkbox" checked={compactMode} onChange={(e) => setCompactMode(e.currentTarget.checked)} /> Compact mode
+            </label>
+            <button onClick={async () => { try { setAboutName(await getName()); setAboutVersion(await getVersion()); } catch {} finally { setAboutOpen(true); } }} style={{ flex: "0 0 auto" }}>About</button>
+          </>
+        )}
+      </div>
+
+      {(tab === "chat" || tab === "coder") && (
+        <>
+          <div className="row" style={{ gap: 8, alignItems: isTiny ? "stretch" : "center", flexWrap: "wrap" }}>
+            {/* Model is fixed to ri1-8b; show as read-only text instead of a dropdown */}
+            <div style={{ minWidth: 160, flex: isTiny ? "1 1 100%" : "1 1 220px", padding: `${basePad}px`, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
+              <div style={{ opacity: 0.7, fontSize: 11 }}>Model</div>
+              <div>ri1-llama:desktop (fixed)</div>
+            </div>
+            <input
+              value={settings.ollamaEndpoint || ""}
+              onChange={(e) => saveSettings({ ...settings, ollamaEndpoint: e.currentTarget.value })}
+              placeholder="Ollama endpoint (http://127.0.0.1:11434)"
+              style={{ minWidth: 160, flex: isTiny ? "1 1 100%" : "1 1 260px", padding: `${basePad}px` }}
+            />
+            <span style={{ fontSize: 12, opacity: 0.8, flex: "0 0 auto" }}>{loading ? "status: generating" : "status: idle"}</span>
+            <button type="button" onClick={stopGeneration} disabled={!loading} style={{ flex: "0 0 auto", padding: `${basePad}px` }}>Stop</button>
+            <button type="button" onClick={retryLast} disabled={loading || !lastUserMessage()} style={{ flex: "0 0 auto", padding: `${basePad}px` }}>Retry</button>
+            <button type="button" onClick={editAndResend} disabled={loading || !lastUserMessage()} style={{ flex: "0 0 auto", padding: `${basePad}px` }}>Edit & Resend</button>
+          </div>
+
+          <form
+            className="row"
+            style={{ gap: 8, alignItems: "flex-start", position: "sticky", bottom: 0, background: "#0b0b0b", paddingBottom: 8 }}
+            onSubmit={(e) => {
+              e.preventDefault();
+              if (!prompt.trim()) return;
+              void send();
+            }}
+          >
+            <div style={{ display: "flex", flexDirection: "column", gap: 6, width: "100%" }}>
+            <div style={{ position: "relative", width: "100%" }}>
+              <textarea
+                ref={promptRef}
+                value={prompt}
+                onChange={(e) => handlePromptChange(e.currentTarget.value)}
+                placeholder="Type your prompt..."
+                rows={5}
+                style={{ width: "100%" }}
+              />
+              {showSuggestions && protocolSuggestions.length > 0 && (
+                <div style={{ 
+                  position: "absolute", 
+                  bottom: "100%", 
+                  left: 0, 
+                  background: "#2a2a2a", 
+                  border: "1px solid #444", 
+                  borderRadius: 6, 
+                  padding: 8, 
+                  marginBottom: 4,
+                  maxWidth: "100%",
+                  zIndex: 100
+                }}>
+                  <div style={{ fontSize: 10, opacity: 0.6, marginBottom: 6 }}>Protocol Suggestions:</div>
+                  <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+                    {protocolSuggestions.map(sug => (
+                      <button
+                        key={sug}
+                        type="button"
+                        onClick={() => applySuggestion(sug)}
+                        style={{ 
+                          fontSize: 11, 
+                          padding: "4px 8px", 
+                          background: "#3a4a5a", 
+                          border: "1px solid #5a6a7a",
+                          borderRadius: 4,
+                          fontFamily: "monospace"
+                        }}
+                      >
+                        {sug}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+            {showSymbols && (
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(10, minmax(0, 1fr))", gap: 6 }}>
+                {symbols.map((s) => (
+                  <button key={s} type="button" onClick={() => insertSymbol(s)} title={`Insert ${s}`}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+            )}
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <input ref={fileInputRef} type="file" accept="application/pdf" style={{ display: "none" }} onChange={onPdfSelected} />
+              <button type="button" onClick={selectPdf} disabled={pdfExtracting}>Attach PDF</button>
+              {docContext && (
+                <span style={{ fontSize: 12, opacity: 0.8 }}>
+                  Context attached ({docContext.length.toLocaleString()} chars)
+                  <button style={{ marginLeft: 8 }} type="button" onClick={() => setDocContext("")}>Clear</button>
+                </span>
+              )}
+              {pdfExtracting && (
+                <span style={{ fontSize: 12, opacity: 0.8 }}>
+                  Extracting PDF… {pdfProgress.done}/{pdfProgress.total}
+                  <button style={{ marginLeft: 8 }} type="button" onClick={stopPdf}>Stop</button>
+                </span>
+              )}
+              <div style={{ flex: 1 }} />
+              <button
+                type="button"
+                onClick={savePromptAsTemplate}
+                disabled={!prompt.trim()}
+                style={{ fontSize: 11 }}
+                title="Save this prompt as a reusable template"
+              >
+                💾 Save Template
+              </button>
+              <button type="submit" disabled={loading || !prompt.trim()} style={{ position: "sticky", right: 0 }}>
+                {loading ? "Generating..." : "Send"}
+              </button>
+            </div>
+            </div>
+          </form>
+        </>
+      )}
+
+      {(error || logs) && (
+        <div style={{ border: "1px solid #5a1", background: "#161616", padding: 8, borderRadius: 6, marginTop: 8 }}>
+          {error && <div style={{ color: "#e33", marginBottom: 6 }}><strong>Error:</strong> {error}</div>}
+          <div className="row" style={{ gap: 8 }}>
+            <button type="button" onClick={() => setLogsOpen(!logsOpen)}>{logsOpen ? "Hide logs" : "Show logs"}</button>
+            <button type="button" onClick={() => setLogs("")}>Clear logs</button>
+          </div>
+          {logsOpen && (
+            <pre style={{ marginTop: 8, maxHeight: 180, overflow: "auto", whiteSpace: "pre-wrap", background: "#0f0f0f", padding: 8, borderRadius: 6 }}>{logs}</pre>
+          )}
+        </div>
+      )}
+
+      {tab === "chat" && (
+      <div style={{ display: "flex", gap: 12, alignItems: "stretch" }}>
+        <section
+          className="messages"
+          ref={scrollRef}
+          style={{
+            borderTop: "1px solid #333",
+            paddingTop: 8,
+            height: 480,
+            overflowY: "auto",
+            flex: 2,
+          }}
+        >
+          {messages.map((m) => {
+            const roleClass = m.role === "user" ? "msg user" : "msg ai";
+            const isUser = m.role === "user";
+            const modelLabel = isUser ? "You" : (m.model || "AI");
+            const backendBadge = !isUser && m.backend ? (m.backend === "ri1" ? "🔷" : "⚪") : "";
+            return (
+              <div key={m.id} className={roleClass}>
+                <div style={{ display: "flex", justifyContent: "space-between", gap: 8 }}>
+                  <strong style={{ opacity: 0.8 }}>
+                    {backendBadge && <span title={m.backend === "ri1" ? "RI1 Engine" : "Ollama"}>{backendBadge} </span>}
+                    {modelLabel}
+                  </strong>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    {!isUser && (
+                      <button
+                        onClick={() => speakingMessageId === m.id ? stopSpeaking() : speakText(m.text, m.id)}
+                        style={{ fontSize: 12 }}
+                        title={speakingMessageId === m.id ? "Stop speaking" : "Read aloud"}
+                      >
+                        {speakingMessageId === m.id ? "🔇" : "🔊"}
+                      </button>
+                    )}
+                    {isUser && m.fullPrompt && (
+                      <button
+                        type="button"
+                        onClick={() => { setFullPromptModalText(m.fullPrompt || ""); setFullPromptModalOpen(true); }}
+                        style={{ fontSize: 12 }}
+                      >
+                        View full prompt
+                      </button>
+                    )}
+                    <button
+                      onClick={() => navigator.clipboard.writeText(m.text)}
+                      style={{ fontSize: 12 }}
+                      title="Copy"
+                    >
+                      Copy
+                    </button>
+                  </div>
+                </div>
+                <div style={{ marginTop: 6 }}>{renderMarkdown(m.text)}</div>
+              </div>
+            );
+          })}
+          {loading && (
+            <div className="msg ai" style={{ opacity: 0.7 }}>
+              <em>Generating…</em>
+            </div>
+          )}
+        </section>
+
+        {/* Context Reservoir panel (MVP UI) */}
+        <aside style={{
+          borderTop: "1px solid #333",
+          paddingTop: 8,
+          height: 480,
+          overflowY: "auto",
+          flex: 1,
+        }}>
+          <h3 style={{ marginTop: 0, marginBottom: 8 }}>Context Reservoir</h3>
+          <div className="row" style={{ gap: 6, marginBottom: 8 }}>
+            <button type="button" onClick={createManualBlock}>+ Block</button>
+            <button type="button" onClick={addBlockFromLastAssistant} disabled={!messages.length}>From Chat</button>
+            <button type="button" onClick={addBlockFromPdfContext} disabled={!docContext}>From PDF</button>
+          </div>
+          <div style={{ fontSize: 12, opacity: 0.8, marginBottom: 8 }}>
+            Φ = Preserve, Δ = Fuse, Λ = Structure
+          </div>
+          <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+            {activeContextBlocks.length === 0 && (
+              <div style={{ opacity: 0.6, fontSize: 11 }}>No context blocks yet.</div>
+            )}
+            {activeContextBlocks
+              // First deduplicate by ID
+              .filter((block, index, self) => 
+                index === self.findIndex(b => b.id === block.id)
+              )
+              // Then sort by chunk number
+              .sort((a, b) => {
+                // Extract chunk number from ID if it's a chunk (format: "chunk-threadId-NNN-hash")
+                const aMatch = a.id.match(/chunk-.*-(\d{3})-/);
+                const bMatch = b.id.match(/chunk-.*-(\d{3})-/);
+                if (aMatch && bMatch) {
+                  return parseInt(aMatch[1]) - parseInt(bMatch[1]);
+                }
+                // Fall back to createdAt for non-chunk blocks
+                return a.createdAt - b.createdAt;
+              }).map((b) => (
+              <div key={b.id} style={{ border: "1px solid #333", borderRadius: 6, padding: 8, fontSize: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", gap: 4, marginBottom: 2 }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4, flexWrap: "wrap" }}>
+                    <button
+                      type="button"
+                      onClick={() => toggleBlockMode(b.id)}
+                      style={{ fontSize: 11, padding: "2px 6px" }}
+                      title="Toggle mode"
+                    >
+                      {b.mode === "phi" ? "Φ" : b.mode === "delta" ? "Δ" : "Λ"}
+                    </button>
+                    <span style={{ fontSize: 10, opacity: 0.6 }}>{b.source}</span>
+                    {b.tags && b.tags.length > 0 && (
+                      <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
+                        {b.tags.slice(0, 3).map(tag => (
+                          <span key={tag} style={{ fontSize: 9, padding: "1px 4px", background: "#2a3a4a", borderRadius: 3, opacity: 0.8 }}>
+                            {tag}
+                          </span>
+                        ))}
+                        {b.tags.length > 3 && (
+                          <span style={{ fontSize: 9, opacity: 0.5 }}>+{b.tags.length - 3}</span>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                  <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+                    <span style={{ fontSize: 10, opacity: 0.5 }}>{(b.attention * 100).toFixed(0)}%</span>
+                    <button type="button" onClick={() => toggleBlockPinned(b.id)} style={{ fontSize: 10, padding: "2px 4px" }}>
+                      {b.pinned ? "⊟" : "⊞"}
+                    </button>
+                    <button type="button" onClick={() => deleteBlock(b.id)} style={{ fontSize: 10, padding: "2px 4px" }}>
+                      ×
+                    </button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.9, maxHeight: 300, overflowY: "auto", lineHeight: 1.5, whiteSpace: "pre-wrap", textAlign: "left" }}>
+                  {b.text}
+                </div>
+              </div>
+            ))}
+          </div>
+        </aside>
+      </div>
+      )}
+
+      {tab === "parser" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 820 }}>
+          <h3 style={{ marginTop: 0 }}>RI1 PDF Parser</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Manual PDF chunking with full control and visibility.
+          </p>
+          
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            <label style={{ fontSize: 12, fontWeight: "bold" }}>Select PDF from Library:</label>
+            <select 
+              style={{ padding: 8, fontSize: 12 }}
+              onChange={(e) => {
+                const selectedNode = pdfNodes.find(n => n.id === e.target.value);
+                if (selectedNode) setSelectedPdfNodeId(selectedNode.id);
+              }}
+              value={selectedPdfNodeId || ""}
+            >
+              <option value="">-- Select a PDF --</option>
+              {pdfNodes.map(n => (
+                <option key={n.id} value={n.id}>{n.name}</option>
+              ))}
+            </select>
+          </div>
+          
+          <div style={{ display: "flex", gap: 12, alignItems: "center" }}>
+            <button 
+              type="button" 
+              onClick={async () => {
+                if (!selectedPdfNodeId) {
+                  alert("Please select a PDF from the library first");
+                  return;
+                }
+                const node = pdfNodes.find(n => n.id === selectedPdfNodeId);
+                if (!node) return;
+                
+                try {
+                  console.log("Starting parse for:", node.name, "at path:", node.path);
+                  
+                  // Clear existing chunks first
+                  setActiveThreadContextBlocks(() => []);
+                  setPdfExtracting(true);
+                  setPdfProgress({ done: 0, total: 0 });
+                  
+                  console.log("Reading PDF file...");
+                  // Read PDF file from disk using Tauri command
+                  const fileBytes = await invoke<number[]>("read_pdf_file", { path: node.path });
+                  console.log("File read complete, bytes:", fileBytes.length);
+                  
+                  console.log("Starting indexing...");
+                  // Trigger indexing - use dummy thread ID if no active thread
+                  const threadForIndexing = activeThreadId || "parser-" + Date.now();
+                  const chunkIds = await invoke<string[]>("index_pdf_stream", {
+                    threadId: threadForIndexing,
+                    fileBytes,
+                  });
+                  
+                  console.log("Indexing complete! Got", chunkIds.length, "chunks");
+                  console.log("Chunks will be added via events");
+                  setPdfExtracting(false);
+                  alert(`Successfully parsed ${node.name}\n${chunkIds.length} chunks created`);
+                } catch (err) {
+                  console.error("Parse error:", err);
+                  setError(String(err));
+                  setPdfExtracting(false);
+                  alert(`Failed to parse: ${err}`);
+                }
+              }}
+              disabled={!selectedPdfNodeId || pdfExtracting}
+            >
+              {pdfExtracting ? "Parsing..." : "Parse Selected PDF"}
+            </button>
+            
+            <button 
+              type="button" 
+              onClick={() => {
+                if (confirm("Clear all chunks from Context Reservoir?")) {
+                  setActiveThreadContextBlocks(() => []);
+                }
+              }}
+            >
+              Clear All Chunks
+            </button>
+          </div>
+          
+          <div style={{ fontSize: 11, opacity: 0.6, padding: 8, border: "1px solid #444", borderRadius: 4 }}>
+            <strong>How it works:</strong><br/>
+            1. Select a PDF from your Library<br/>
+            2. Click "Parse Selected PDF" to extract and chunk<br/>
+            3. Chunks appear in Context Reservoir (5 pages per chunk)<br/>
+            4. Each chunk has a unique hash to prevent duplicates<br/>
+            5. Go to Chat tab to use chunks in conversations
+          </div>
+        </section>
+      )}
+
+      {tab === "workshop" && <Workshop defaultModel={model || "ri1-llama:desktop"} />}
+
+      {tab === "crm" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12 }}>
+          <h3 style={{ marginTop: 0 }}>CRM Switchboard (32×32)</h3>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <button type="button" onClick={() => { void loadCrm(); }} disabled={crmLoading}>
+              {crmLoading ? "Loading…" : "Refresh"}
+            </button>
+            {crmError && (
+              <span style={{ color: "#f97373", fontSize: 12 }}>{crmError}</span>
+            )}
+          </div>
+          {crmSnapshot ? (
+            <div style={{ display: "flex", gap: 16, alignItems: "flex-start" }}>
+              <div
+                style={{
+                  display: "grid",
+                  gridTemplateColumns: "repeat(32, 12px)",
+                  gridTemplateRows: "repeat(32, 12px)",
+                  gap: 1,
+                  border: "1px solid #1f2933",
+                  padding: 4,
+                  background: "#020617",
+                }}
+              >
+                {crmSnapshot.matrix.map((row, i) =>
+                  row.map((w, j) => {
+                    const abs = Math.min(Math.abs(w), 1);
+                    const intensity = Math.round(abs * 255);
+                    const color = w >= 0
+                      ? `rgb(0, ${intensity}, 0)`
+                      : `rgb(${intensity}, 0, 0)`;
+                    return (
+                      <div
+                        key={`${i}-${j}`}
+                        title={`${crmSnapshot.nodes[i]} → ${crmSnapshot.nodes[j]} = ${w.toFixed(3)}`}
+                        style={{
+                          width: 12,
+                          height: 12,
+                          backgroundColor: color,
+                        }}
+                      />
+                    );
+                  })
+                )}
+              </div>
+              <div style={{ fontFamily: "monospace", fontSize: 12 }}>
+                <div style={{ marginBottom: 4 }}>
+                  Rows: source operator (i), Columns: target operator (j)
+                </div>
+                {crmSnapshot.nodes.map((sym, idx) => (
+                  <div key={idx}>
+                    {idx.toString().padStart(2, "0")}: {sym}
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              No CRM snapshot loaded. Click <strong>Refresh</strong> to fetch from RI1 engine.
+            </div>
+          )}
+        </section>
+      )}
+
+      {tab === "coder" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 900 }}>
+          <h3 style={{ marginTop: 0 }}>🧑‍💻 Coder (Python & Rust)</h3>
+          <p style={{ fontSize: 12, opacity: 0.85, margin: 0 }}>
+            This view is tuned for editing Python and Rust projects while you work in an IDE like Windsurf. Paste code or describe a change, pick a language, and keep <strong>Coder mode</strong> enabled in the toolbar above.
+          </p>
+
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => `You are a senior Python engineer. Improve, refactor, or fix the following Python code. Explain only when necessary, and focus on concrete edits.\n\n` + prev)}
+              style={{ fontSize: 12 }}
+            >
+              🐍 Python focus
+            </button>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => `You are a senior Rust engineer. Improve, refactor, or fix the following Rust code. Respect ownership and lifetimes, and prefer idiomatic Rust.\n\n` + prev)}
+              style={{ fontSize: 12 }}
+            >
+              🦀 Rust focus
+            </button>
+          </div>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 4 }}>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => prev + (prev ? "\n\n" : "") + "Explain what this code does, step by step, as if I will immediately edit it in an IDE.")}
+              style={{ fontSize: 11 }}
+            >
+              🔍 Explain code
+            </button>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => prev + (prev ? "\n\n" : "") + "Refactor this code to be clearer and more idiomatic, keeping behavior the same.")}
+              style={{ fontSize: 11 }}
+            >
+              ✨ Refactor
+            </button>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => prev + (prev ? "\n\n" : "") + "Write tests for this code in its primary language (pytest for Python, or Rust tests in the same crate).")}
+              style={{ fontSize: 11 }}
+            >
+              ✅ Write tests
+            </button>
+            <button
+              type="button"
+              onClick={() => setPrompt(prev => prev + (prev ? "\n\n" : "") + "There is a bug here. Find likely issues and propose minimal fixes.")}
+              style={{ fontSize: 11 }}
+            >
+              🐛 Debug
+            </button>
+          </div>
+
+          <p style={{ fontSize: 12, opacity: 0.8, margin: 0 }}>
+            Use the main prompt box and <strong>Send</strong> button as usual. Coder mode will ask the model to return minimal, file‑scoped edits and diffs that are easy to apply in your IDE.
+          </p>
+        </section>
+      )}
+
+      {tab === "kosmos" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 8 }}>
+          <div className="row" style={{ gap: 8 }}>
+            <input
+              value={kModel}
+              onChange={(e) => setKModel(e.currentTarget.value)}
+              placeholder="Ollama model for Kosmos"
+              style={{ minWidth: 280 }}
+              list="ollama-models"
+            />
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={kOffline} onChange={(e) => setKOffline(e.currentTarget.checked)} /> Offline
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={kEmitRaw} onChange={(e) => setKEmitRaw(e.currentTarget.checked)} /> Emit raw
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={kUseReservoir} onChange={(e) => setKUseReservoir(e.currentTarget.checked)} /> Use Reservoir
+            </label>
+          </div>
+          <form onSubmit={runKosmos} className="row" style={{ gap: 8, alignItems: "flex-start" }}>
+            <textarea
+              value={kPrompt}
+              onChange={(e) => setKPrompt(e.currentTarget.value)}
+              placeholder="Enter Kosmos research prompt..."
+              rows={5}
+              style={{ width: "100%" }}
+            />
+            <button type="submit" disabled={kRunning || !kPrompt.trim()}>{kRunning ? "Running…" : "Run"}</button>
+          </form>
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12, alignItems: "start" }}>
+            <div style={{ border: "1px solid #333", padding: 8, borderRadius: 6, maxHeight: 420, overflowY: "auto" }}>
+              <h3 style={{ marginTop: 0 }}>Parsed</h3>
+              {kParsed ? (
+                <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+                  <div>
+                    <strong>Status:</strong> {String(kParsed.status ?? "")} 
+                  </div>
+                  <div>
+                    <strong>Next action:</strong> {String(kParsed.next_action ?? "")}
+                  </div>
+                  {typeof kParsed.research_plan === 'string' && (
+                    <div>
+                      <strong>Research plan:</strong>
+                      <div style={{ whiteSpace: "pre-wrap", marginTop: 6 }}>
+                        {kPlanExpanded ? kParsed.research_plan : (kParsed.research_plan.length > 600 ? kParsed.research_plan.slice(0, 600) + "…" : kParsed.research_plan)}
+                      </div>
+                      {kParsed.research_plan.length > 600 && (
+                        <button style={{ marginTop: 6 }} onClick={() => setKPlanExpanded(!kPlanExpanded)}>
+                          {kPlanExpanded ? "Collapse" : "Expand"}
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+              ) : (
+                <div style={{ opacity: 0.7 }}>No parsed JSON yet.</div>
+              )}
+            </div>
+            <div style={{ border: "1px solid #333", padding: 8, borderRadius: 6, maxHeight: 420, overflowY: "auto" }}>
+              <h3 style={{ marginTop: 0 }}>Raw</h3>
+              <pre style={{ margin: 0, whiteSpace: "pre-wrap" }}>{kOutput}</pre>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {tab === "search" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 820 }}>
+          <h3 style={{ marginTop: 0 }}>🔍 Semantic Search</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Search across all threads, context blocks, and PDFs
+          </p>
+          
+          <div style={{ display: "flex", gap: 8 }}>
+            <input
+              type="text"
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              onKeyPress={(e) => e.key === 'Enter' && performSearch(searchQuery)}
+              placeholder="Search for anything... (Φ, harmonics, recursion, etc.)"
+              style={{ flex: 1, padding: 8, fontSize: 14 }}
+            />
+            <button onClick={() => performSearch(searchQuery)}>Search</button>
+            <button onClick={() => { setSearchQuery(""); setSearchResults([]); }}>Clear</button>
+          </div>
+
+          {searchResults.length > 0 && (
+            <div style={{ fontSize: 12, opacity: 0.7 }}>
+              Found {searchResults.length} results
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+            {searchResults.map((result, idx) => (
+              <div key={idx} style={{ border: "1px solid #333", borderRadius: 6, padding: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <span style={{ fontSize: 11, padding: "2px 6px", background: result.type === "thread" ? "#1b4332" : result.type === "block" ? "#1a3a52" : "#4a1a3a", borderRadius: 4 }}>
+                      {result.type === "thread" ? "💬 Thread" : result.type === "block" ? "📦 Block" : "📄 PDF"}
+                    </span>
+                    {result.threadTitle && (
+                      <span style={{ fontSize: 11, opacity: 0.6 }}>{result.threadTitle}</span>
+                    )}
+                    <span style={{ fontSize: 11, opacity: 0.5 }}>Score: {result.score}</span>
+                  </div>
+                  <button
+                    onClick={() => {
+                      if (result.type === "thread") {
+                        setActiveThreadId(result.id);
+                        setTab("chat");
+                      } else if (result.type === "pdf") {
+                        setSelectedPdfNodeId(result.id);
+                        setTab("library");
+                      }
+                    }}
+                    style={{ fontSize: 11 }}
+                  >
+                    Go →
+                  </button>
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.9, lineHeight: 1.5 }}>
+                  {result.text}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          {searchQuery && searchResults.length === 0 && (
+            <div style={{ fontSize: 12, opacity: 0.6, textAlign: "center", padding: 20 }}>
+              No results found for "{searchQuery}"
+            </div>
+          )}
+
+          <hr style={{ border: "none", borderTop: "1px solid #333", margin: "24px 0" }} />
+
+          <h3 style={{ marginTop: 0 }}>📝 Auto-Extracted Protocols</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            RI1 protocol expressions automatically detected from conversations ({extractedProtocols.length} found)
+          </p>
+
+          {extractedProtocols.length === 0 && (
+            <div style={{ fontSize: 12, opacity: 0.6, padding: 12, textAlign: "center" }}>
+              No protocols extracted yet. RI1 will automatically detect protocol expressions in responses.
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12 }}>
+            {extractedProtocols.slice(0, 20).map(proto => (
+              <div key={proto.id} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <code style={{ fontSize: 16, fontWeight: "bold", color: "#4fc3f7" }}>
+                    {proto.expression}
+                  </code>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => {
+                        setActiveThreadId(proto.threadId);
+                        setTab("chat");
+                      }}
+                      style={{ fontSize: 11 }}
+                    >
+                      View Thread
+                    </button>
+                    <button
+                      onClick={() => {
+                        setPrompt(proto.expression);
+                        setTab("chat");
+                      }}
+                      style={{ fontSize: 11 }}
+                    >
+                      Use →
+                    </button>
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 4 }}>
+                  {new Date(proto.timestamp).toLocaleString()}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.8, lineHeight: 1.5, fontStyle: "italic" }}>
+                  {proto.explanation}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #333", margin: "24px 0" }} />
+
+          <h3 style={{ marginTop: 0 }}>💾 Prompt Templates</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Saved prompt templates for quick reuse ({promptTemplates.length} saved)
+          </p>
+
+          {promptTemplates.length === 0 && (
+            <div style={{ fontSize: 12, opacity: 0.6, padding: 12, textAlign: "center" }}>
+              No templates yet. Click "💾 Save Template" in Chat to save prompts for reuse.
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 8, marginTop: 12 }}>
+            {promptTemplates.map(tmpl => (
+              <div key={tmpl.id} style={{ border: "1px solid #444", borderRadius: 6, padding: 12 }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <strong style={{ fontSize: 14 }}>{tmpl.name}</strong>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button
+                      onClick={() => {
+                        loadTemplate(tmpl);
+                        setTab("chat");
+                      }}
+                      style={{ fontSize: 11 }}
+                    >
+                      Load →
+                    </button>
+                    <button
+                      onClick={() => {
+                        if (confirm(`Delete template "${tmpl.name}"?`)) {
+                          deleteTemplate(tmpl.id);
+                        }
+                      }}
+                      style={{ fontSize: 11 }}
+                    >
+                      Delete
+                    </button>
+                  </div>
+                </div>
+                {tmpl.description && (
+                  <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 6, fontStyle: "italic" }}>
+                    {tmpl.description}
+                  </div>
+                )}
+                <div style={{ fontSize: 11, opacity: 0.6, marginBottom: 6 }}>
+                  {new Date(tmpl.timestamp).toLocaleString()}
+                </div>
+                <div style={{ fontSize: 12, opacity: 0.8, background: "#1a1a1a", padding: 8, borderRadius: 4, fontFamily: "monospace", whiteSpace: "pre-wrap" }}>
+                  {tmpl.prompt}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #333", margin: "24px 0" }} />
+
+          <h3 style={{ marginTop: 0 }}>🧠 Cross-Thread Knowledge</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Concepts tracked across all conversations ({knowledgeGraph.length} concepts)
+          </p>
+
+          {knowledgeGraph.length === 0 && (
+            <div style={{ fontSize: 12, opacity: 0.6, padding: 12, textAlign: "center" }}>
+              No cross-thread knowledge yet. RI1 will automatically track concepts across all your conversations.
+            </div>
+          )}
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 6, marginTop: 12 }}>
+            {knowledgeGraph
+              .sort((a, b) => b.mentions - a.mentions)
+              .slice(0, 30)
+              .map(item => (
+                <div key={item.concept} style={{ border: "1px solid #3a3a3a", borderRadius: 4, padding: 8, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <code style={{ fontSize: 13, fontWeight: "bold", color: "#81c784" }}>
+                      {item.concept}
+                    </code>
+                    <span style={{ fontSize: 10, opacity: 0.6 }}>
+                      {item.mentions} {item.mentions === 1 ? 'mention' : 'mentions'} across {item.relatedThreads.length} {item.relatedThreads.length === 1 ? 'thread' : 'threads'}
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 4 }}>
+                    {item.relatedThreads.slice(0, 3).map(tid => {
+                      const thread = threads.find(t => t.id === tid);
+                      return thread ? (
+                        <button
+                          key={tid}
+                          onClick={() => {
+                            setActiveThreadId(tid);
+                            setTab("chat");
+                          }}
+                          style={{ fontSize: 10, padding: "2px 6px" }}
+                          title={thread.title}
+                        >
+                          {thread.title.substring(0, 15)}...
+                        </button>
+                      ) : null;
+                    })}
+                    {item.relatedThreads.length > 3 && (
+                      <span style={{ fontSize: 10, opacity: 0.5 }}>+{item.relatedThreads.length - 3}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #333", margin: "24px 0" }} />
+
+          <h3 style={{ marginTop: 0 }}>🕸️ Concept Relationships</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Visual map of concept connections
+          </p>
+
+          {knowledgeGraph.length > 0 && (
+            <div style={{ 
+              border: "1px solid #333", 
+              borderRadius: 6, 
+              padding: 16, 
+              background: "#0a0a0a", 
+              minHeight: 200,
+              display: "flex",
+              flexWrap: "wrap",
+              gap: 12,
+              alignItems: "center",
+              justifyContent: "center"
+            }}>
+              {knowledgeGraph.slice(0, 20).map((item, idx) => {
+                const size = Math.min(18, 10 + Math.log(item.mentions + 1) * 3);
+                const opacity = 0.5 + (item.mentions / (Math.max(...knowledgeGraph.map(k => k.mentions)) || 1)) * 0.5;
+                return (
+                  <div
+                    key={item.concept}
+                    style={{
+                      fontSize: size,
+                      opacity,
+                      padding: "4px 8px",
+                      border: "1px solid #4a4a4a",
+                      borderRadius: 4,
+                      background: `hsl(${idx * 137.5}, 50%, 30%)`,
+                      cursor: "pointer",
+                      transition: "all 0.2s"
+                    }}
+                    onClick={() => {
+                      setSearchQuery(item.concept);
+                      performSearch(item.concept);
+                      window.scrollTo({ top: 0, behavior: "smooth" });
+                    }}
+                    title={`${item.mentions} mentions across ${item.relatedThreads.length} threads`}
+                  >
+                    {item.concept}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {knowledgeGraph.length === 0 && (
+            <div style={{ fontSize: 12, opacity: 0.6, padding: 12, textAlign: "center" }}>
+              Concept relationships will appear here as you use RI1
+            </div>
+          )}
+        </section>
+      )}
+
+      {tab === "graph" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 1200 }}>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <h3 style={{ marginTop: 0, marginBottom: 4 }}>🕸️ Neural Architecture Graph</h3>
+              <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+                Visual map of RI1 Desktop's intelligence pipeline
+              </p>
+            </div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+              <button 
+                onClick={() => setGraphZoom(z => Math.min(z + 0.2, 3))}
+                style={{ fontSize: 14, padding: "6px 12px" }}
+                title="Zoom In"
+              >
+                🔍+
+              </button>
+              <button 
+                onClick={() => setGraphZoom(z => Math.max(z - 0.2, 0.5))}
+                style={{ fontSize: 14, padding: "6px 12px" }}
+                title="Zoom Out"
+              >
+                🔍−
+              </button>
+              <button 
+                onClick={() => { setGraphZoom(1); setGraphPan({ x: 0, y: 0 }); }}
+                style={{ fontSize: 11, padding: "6px 12px" }}
+                title="Reset View"
+              >
+                Reset
+              </button>
+              <span style={{ fontSize: 11, opacity: 0.6, minWidth: 50 }}>
+                {Math.round(graphZoom * 100)}%
+              </span>
+              {graphZoom > 1 && (
+                <span style={{ fontSize: 10, opacity: 0.5, fontStyle: "italic" }}>
+                  Drag to pan
+                </span>
+              )}
+            </div>
+          </div>
+
+          <div style={{ display: "flex", gap: 12 }}>
+            <div style={{ flex: 1, border: "1px solid #333", borderRadius: 8, padding: 20, background: "#0a0a0a", minHeight: 600, position: "relative", overflow: "hidden" }}>
+              <svg 
+                width="100%" 
+                height="600" 
+                viewBox="0 0 1000 600" 
+                style={{ cursor: isDragging ? "grabbing" : (graphZoom > 1 ? "grab" : "default") }}
+                onMouseDown={(e) => {
+                  if (graphZoom > 1) {
+                    setIsDragging(true);
+                    setDragStart({ x: e.clientX - graphPan.x, y: e.clientY - graphPan.y });
+                  }
+                }}
+                onMouseMove={(e) => {
+                  if (isDragging && graphZoom > 1) {
+                    setGraphPan({
+                      x: e.clientX - dragStart.x,
+                      y: e.clientY - dragStart.y
+                    });
+                  }
+                }}
+                onMouseUp={() => setIsDragging(false)}
+                onMouseLeave={() => setIsDragging(false)}
+                onWheel={(e) => {
+                  e.preventDefault();
+                  const delta = e.deltaY > 0 ? -0.1 : 0.1;
+                  setGraphZoom(z => Math.max(0.5, Math.min(3, z + delta)));
+                }}
+              >
+                <g transform={`scale(${graphZoom}) translate(${graphPan.x}, ${graphPan.y})`}>
+                {/* Input Layer */}
+                <text x="50" y="30" fill="#888" fontSize="14" fontWeight="bold">INPUT LAYER</text>
+                <g onClick={() => setSelectedNode("user")} style={{ cursor: "pointer" }}>
+                  <circle cx="100" cy="80" r="30" fill="#1a4d2e" stroke="#2d7a4f" strokeWidth="2" />
+                  <text x="100" y="85" fill="#fff" fontSize="12" textAnchor="middle">User</text>
+                </g>
+                <g onClick={() => setSelectedNode("pdf")} style={{ cursor: "pointer" }}>
+                  <circle cx="100" cy="160" r="30" fill="#4a1a3a" stroke="#7a2d5a" strokeWidth="2" />
+                  <text x="100" y="165" fill="#fff" fontSize="12" textAnchor="middle">PDFs</text>
+                </g>
+                <g onClick={() => setSelectedNode("context")} style={{ cursor: "pointer" }}>
+                  <circle cx="100" cy="240" r="30" fill="#1a3a52" stroke="#2d5a7f" strokeWidth="2" />
+                  <text x="100" y="245" fill="#fff" fontSize="12" textAnchor="middle">Context</text>
+                </g>
+
+                {/* Processing Layer */}
+                <text x="300" y="30" fill="#888" fontSize="14" fontWeight="bold">PROCESSING</text>
+                <g onClick={() => setSelectedNode("ri1")} style={{ cursor: "pointer" }}>
+                  <rect x="270" y="50" width="120" height="60" rx="10" fill="#2a1a4a" stroke="#4a2d7a" strokeWidth="3" />
+                  <text x="330" y="80" fill="#fff" fontSize="13" textAnchor="middle" fontWeight="bold">RI1 Engine</text>
+                  <text x="330" y="95" fill="#aaa" fontSize="10" textAnchor="middle">sotma-phishell</text>
+                </g>
+                <g onClick={() => setSelectedNode("ollama")} style={{ cursor: "pointer" }}>
+                  <rect x="270" y="130" width="120" height="60" rx="10" fill="#1a2a3a" stroke="#2d4a6a" strokeWidth="2" />
+                  <text x="330" y="165" fill="#fff" fontSize="13" textAnchor="middle">Ollama</text>
+                </g>
+                <g onClick={() => setSelectedNode("parser")} style={{ cursor: "pointer" }}>
+                  <rect x="270" y="210" width="120" height="60" rx="10" fill="#3a1a1a" stroke="#6a2d2d" strokeWidth="2" />
+                  <text x="330" y="245" fill="#fff" fontSize="13" textAnchor="middle">PDF Parser</text>
+                </g>
+
+                {/* Intelligence Layer */}
+                <text x="550" y="30" fill="#888" fontSize="14" fontWeight="bold">INTELLIGENCE</text>
+                <g onClick={() => setSelectedNode("tagger")} style={{ cursor: "pointer" }}>
+                  <ellipse cx="600" cy="70" rx="60" ry="30" fill="#1a3a1a" stroke="#2d6a2d" strokeWidth="2" />
+                  <text x="600" y="75" fill="#fff" fontSize="11" textAnchor="middle">Auto-Tagger</text>
+                </g>
+                <g onClick={() => setSelectedNode("prioritizer")} style={{ cursor: "pointer" }}>
+                  <ellipse cx="600" cy="130" rx="60" ry="30" fill="#3a2a1a" stroke="#6a4a2d" strokeWidth="2" />
+                  <text x="600" y="135" fill="#fff" fontSize="11" textAnchor="middle">Prioritizer</text>
+                </g>
+                <g onClick={() => setSelectedNode("extractor")} style={{ cursor: "pointer" }}>
+                  <ellipse cx="600" cy="190" rx="60" ry="30" fill="#1a1a3a" stroke="#2d2d6a" strokeWidth="2" />
+                  <text x="600" y="195" fill="#fff" fontSize="11" textAnchor="middle">Protocol Extract</text>
+                </g>
+                <g onClick={() => setSelectedNode("knowledge")} style={{ cursor: "pointer" }}>
+                  <ellipse cx="600" cy="250" rx="60" ry="30" fill="#2a1a2a" stroke="#5a2d5a" strokeWidth="2" />
+                  <text x="600" y="255" fill="#fff" fontSize="11" textAnchor="middle">Knowledge Graph</text>
+                </g>
+
+                {/* Output Layer */}
+                <text x="800" y="30" fill="#888" fontSize="14" fontWeight="bold">OUTPUT</text>
+                <g onClick={() => setSelectedNode("messages")} style={{ cursor: "pointer" }}>
+                  <circle cx="850" cy="80" r="35" fill="#1a4d2e" stroke="#2d7a4f" strokeWidth="2" />
+                  <text x="850" y="85" fill="#fff" fontSize="12" textAnchor="middle">Messages</text>
+                </g>
+                <g onClick={() => setSelectedNode("reservoir")} style={{ cursor: "pointer" }}>
+                  <circle cx="850" cy="170" r="35" fill="#1a3a52" stroke="#2d5a7f" strokeWidth="2" />
+                  <text x="850" y="170" fill="#fff" fontSize="11" textAnchor="middle">Context</text>
+                  <text x="850" y="182" fill="#fff" fontSize="11" textAnchor="middle">Reservoir</text>
+                </g>
+                <g onClick={() => setSelectedNode("search")} style={{ cursor: "pointer" }}>
+                  <circle cx="850" cy="260" r="35" fill="#4a1a3a" stroke="#7a2d5a" strokeWidth="2" />
+                  <text x="850" y="265" fill="#fff" fontSize="12" textAnchor="middle">Search</text>
+                </g>
+
+                {/* Connections - Input to Processing */}
+                <line x1="130" y1="80" x2="270" y2="80" stroke="#4a4a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="130" y1="160" x2="270" y2="240" stroke="#4a4a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="130" y1="240" x2="270" y2="80" stroke="#4a4a4a" strokeWidth="2" markerEnd="url(#arrowhead)" strokeDasharray="5,5" />
+
+                {/* Connections - Processing to Intelligence */}
+                <line x1="390" y1="80" x2="540" y2="70" stroke="#6a6a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="390" y1="80" x2="540" y2="130" stroke="#6a6a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="390" y1="80" x2="540" y2="190" stroke="#6a6a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="390" y1="160" x2="540" y2="250" stroke="#6a6a4a" strokeWidth="2" markerEnd="url(#arrowhead)" strokeDasharray="5,5" />
+
+                {/* Connections - Intelligence to Output */}
+                <line x1="660" y1="70" x2="815" y2="170" stroke="#8a8a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="660" y1="130" x2="815" y2="170" stroke="#8a8a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="660" y1="190" x2="815" y2="260" stroke="#8a8a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+                <line x1="660" y1="250" x2="815" y2="260" stroke="#8a8a4a" strokeWidth="2" markerEnd="url(#arrowhead)" />
+
+                {/* Direct connections - Processing to Output */}
+                <line x1="390" y1="80" x2="815" y2="80" stroke="#4a7a4a" strokeWidth="3" markerEnd="url(#arrowhead)" />
+                <line x1="390" y1="160" x2="815" y2="80" stroke="#4a6a7a" strokeWidth="2" markerEnd="url(#arrowhead)" strokeDasharray="5,5" />
+
+                {/* Arrow marker definition */}
+                <defs>
+                  <marker id="arrowhead" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto">
+                    <polygon points="0 0, 10 3, 0 6" fill="#6a6a6a" />
+                  </marker>
+                </defs>
+
+                {/* Legend */}
+                <g transform="translate(50, 500)">
+                  <text x="0" y="0" fill="#888" fontSize="11" fontWeight="bold">Legend:</text>
+                  <line x1="0" y1="15" x2="40" y2="15" stroke="#6a6a6a" strokeWidth="2" />
+                  <text x="45" y="18" fill="#aaa" fontSize="10">Data flow</text>
+                  <line x1="0" y1="35" x2="40" y2="35" stroke="#6a6a6a" strokeWidth="2" strokeDasharray="5,5" />
+                  <text x="45" y="38" fill="#aaa" fontSize="10">Optional path</text>
+                  <line x1="0" y1="55" x2="40" y2="55" stroke="#4a7a4a" strokeWidth="3" />
+                  <text x="45" y="58" fill="#aaa" fontSize="10">Primary output</text>
+                </g>
+
+                {/* Stats */}
+                <g transform="translate(700, 340)">
+                  <rect x="0" y="0" width="250" height="220" rx="8" fill="#1a1a1a" stroke="#333" strokeWidth="1" />
+                  <text x="10" y="20" fill="#888" fontSize="12" fontWeight="bold">System Statistics</text>
+                  <text x="10" y="45" fill="#aaa" fontSize="11">Threads: {threads.length}</text>
+                  <text x="10" y="65" fill="#aaa" fontSize="11">Messages: {threads.reduce((acc, t) => acc + t.messages.length, 0)}</text>
+                  <text x="10" y="85" fill="#aaa" fontSize="11">Context Blocks: {threads.reduce((acc, t) => acc + (t.contextBlocks?.length || 0), 0)}</text>
+                  <text x="10" y="105" fill="#aaa" fontSize="11">PDFs: {pdfNodes.length}</text>
+                  <text x="10" y="125" fill="#aaa" fontSize="11">Protocols: {extractedProtocols.length}</text>
+                  <text x="10" y="145" fill="#aaa" fontSize="11">Templates: {promptTemplates.length}</text>
+                  <text x="10" y="165" fill="#aaa" fontSize="11">Knowledge: {knowledgeGraph.length} concepts</text>
+                  <text x="10" y="185" fill="#aaa" fontSize="11">Model: {model}</text>
+                  <text x="10" y="205" fill="#aaa" fontSize="11">Engine: {useRi1 ? "RI1" : "Ollama"}</text>
+                </g>
+                </g>
+              </svg>
+            </div>
+
+            {/* Node Details Panel */}
+            <div style={{ width: 200, border: "1px solid #333", borderRadius: 8, padding: 12, background: "#0a0a0a", fontSize: 11 }}>
+              <h4 style={{ marginTop: 0, fontSize: 13 }}>Node Details</h4>
+              {selectedNode === "user" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>User Input</strong></p>
+                  <p>Entry point for prompts and queries. Supports:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Natural language</li>
+                    <li>RI1 protocol symbols</li>
+                    <li>Template loading</li>
+                    <li>Symbol keyboard</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "pdf" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>PDF Input</strong></p>
+                  <p>Document processing pipeline:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Structure-aware chunking</li>
+                    <li>Header detection</li>
+                    <li>Smart boundaries</li>
+                    <li>{pdfNodes.length} PDFs loaded</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "context" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Context Reservoir</strong></p>
+                  <p>Memory management system:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Φ (Phi): Persistent</li>
+                    <li>Δ (Delta): Fusible</li>
+                    <li>Λ (Lambda): Structural</li>
+                    <li>{threads.reduce((acc, t) => acc + (t.contextBlocks?.length || 0), 0)} total blocks</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "ri1" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>RI1 Engine</strong></p>
+                  <p>Primary intelligence layer:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Model: {model}</li>
+                    <li>Protocol-aware</li>
+                    <li>Context integration</li>
+                    <li>Learned preferences</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "ollama" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Ollama Backend</strong></p>
+                  <p>Alternative inference engine:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Direct model access</li>
+                    <li>No protocol layer</li>
+                    <li>Faster responses</li>
+                    <li>Status: {daemonRunning ? "Online" : "Offline"}</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "parser" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>PDF Parser</strong></p>
+                  <p>Intelligent document processor:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>30k char chunks</li>
+                    <li>Header detection</li>
+                    <li>Hash-based IDs</li>
+                    <li>No overlap</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "tagger" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Auto-Tagger</strong></p>
+                  <p>Semantic labeling system:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Protocol detection</li>
+                    <li>Concept extraction</li>
+                    <li>15+ tag categories</li>
+                    <li>Real-time tagging</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "prioritizer" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Smart Prioritizer</strong></p>
+                  <p>Relevance-based ranking:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Keyword matching</li>
+                    <li>Tag alignment</li>
+                    <li>Symbol detection</li>
+                    <li>Recency boost</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "extractor" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Protocol Extractor</strong></p>
+                  <p>Pattern recognition:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Greek symbols</li>
+                    <li>Operators</li>
+                    <li>Expressions</li>
+                    <li>{extractedProtocols.length} extracted</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "knowledge" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Knowledge Graph</strong></p>
+                  <p>Cross-thread memory:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>{knowledgeGraph.length} concepts</li>
+                    <li>Thread linking</li>
+                    <li>Mention tracking</li>
+                    <li>Auto-updating</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "messages" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Message Output</strong></p>
+                  <p>Conversation display:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>{threads.reduce((acc, t) => acc + t.messages.length, 0)} total messages</li>
+                    <li>Markdown rendering</li>
+                    <li>Model tracking</li>
+                    <li>Export support</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "reservoir" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Context Reservoir</strong></p>
+                  <p>Active memory pool:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Mode switching</li>
+                    <li>Attention tracking</li>
+                    <li>Pin/delete control</li>
+                    <li>Auto-prioritization</li>
+                  </ul>
+                </div>
+              )}
+              {selectedNode === "search" && (
+                <div style={{ fontSize: 10, lineHeight: 1.5 }}>
+                  <p><strong>Search Output</strong></p>
+                  <p>Intelligence access:</p>
+                  <ul style={{ paddingLeft: 12 }}>
+                    <li>Semantic search</li>
+                    <li>Protocol library</li>
+                    <li>Templates</li>
+                    <li>Knowledge graph</li>
+                  </ul>
+                </div>
+              )}
+              {!selectedNode && (
+                <div style={{ fontSize: 10, opacity: 0.6, lineHeight: 1.5 }}>
+                  <p>Click any node to view details about that component.</p>
+                  <p>Lines show data flow through the system.</p>
+                  <p>Solid lines = primary paths<br/>Dashed lines = optional paths</p>
+                </div>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {tab === "analytics" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 1000 }}>
+          <h3 style={{ marginTop: 0 }}>📊 Analytics Dashboard</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Usage insights and statistics
+          </p>
+
+          {/* Quick Stats Grid */}
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))", gap: 12 }}>
+            <div style={{ border: "1px solid #2d7a4f", borderRadius: 8, padding: 16, background: "#1a4d2e" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{threads.length}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Total Threads</div>
+            </div>
+            <div style={{ border: "1px solid #4a2d7a", borderRadius: 8, padding: 16, background: "#2a1a4a" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{threads.reduce((acc, t) => acc + t.messages.length, 0)}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Total Messages</div>
+            </div>
+            <div style={{ border: "1px solid #2d5a7f", borderRadius: 8, padding: 16, background: "#1a3a52" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{threads.reduce((acc, t) => acc + (t.contextBlocks?.length || 0), 0)}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Context Blocks</div>
+            </div>
+            <div style={{ border: "1px solid #7a2d5a", borderRadius: 8, padding: 16, background: "#4a1a3a" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{pdfNodes.length}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>PDFs Indexed</div>
+            </div>
+            <div style={{ border: "1px solid #6a4a2d", borderRadius: 8, padding: 16, background: "#3a2a1a" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{extractedProtocols.length}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Protocols Extracted</div>
+            </div>
+            <div style={{ border: "1px solid #2d6a2d", borderRadius: 8, padding: 16, background: "#1a3a1a" }}>
+              <div style={{ fontSize: 28, fontWeight: "bold" }}>{knowledgeGraph.length}</div>
+              <div style={{ fontSize: 12, opacity: 0.8 }}>Knowledge Concepts</div>
+            </div>
+          </div>
+
+          {/* Protocol Symbol Usage */}
+          <div style={{ border: "1px solid #333", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+            <h4 style={{ marginTop: 0 }}>Protocol Symbol Usage</h4>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              {['Φ', 'Δ', 'Λ', 'π', 'ε', 'Ω', 'Ψ', 'Ξ', 'Γ', 'Σ'].map(symbol => {
+                const count = threads.reduce((acc, t) => 
+                  acc + t.messages.reduce((macc, m) => 
+                    macc + (m.text.match(new RegExp(symbol, 'g')) || []).length, 0), 0);
+                return count > 0 ? (
+                  <div key={symbol} style={{ padding: "8px 16px", border: "1px solid #444", borderRadius: 6, background: "#1a1a1a" }}>
+                    <span style={{ fontSize: 20, marginRight: 8 }}>{symbol}</span>
+                    <span style={{ fontSize: 14, opacity: 0.7 }}>{count}</span>
+                  </div>
+                ) : null;
+              })}
+            </div>
+          </div>
+
+          {/* Activity Timeline */}
+          <div style={{ border: "1px solid #333", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+            <h4 style={{ marginTop: 0 }}>Thread Activity</h4>
+            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+              {threads.slice(0, 10).map(thread => {
+                const messageCount = thread.messages.length;
+                const barWidth = Math.max(5, (messageCount / Math.max(...threads.map(t => t.messages.length), 1)) * 100);
+                return (
+                  <div key={thread.id} style={{ display: "flex", alignItems: "center", gap: 12 }}>
+                    <div style={{ width: 200, fontSize: 11, opacity: 0.8, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                      {thread.title}
+                    </div>
+                    <div style={{ flex: 1, height: 20, background: "#1a1a1a", borderRadius: 4, position: "relative" }}>
+                      <div style={{ width: `${barWidth}%`, height: "100%", background: "linear-gradient(90deg, #2d7a4f, #4a2d7a)", borderRadius: 4 }} />
+                    </div>
+                    <div style={{ width: 40, fontSize: 11, opacity: 0.7, textAlign: "right" }}>
+                      {messageCount}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          </div>
+
+          {/* Top Concepts */}
+          <div style={{ border: "1px solid #333", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+            <h4 style={{ marginTop: 0 }}>Top Knowledge Concepts</h4>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(150px, 1fr))", gap: 8 }}>
+              {knowledgeGraph
+                .sort((a, b) => b.mentions - a.mentions)
+                .slice(0, 12)
+                .map(concept => (
+                  <div key={concept.concept} style={{ padding: "8px 12px", border: "1px solid #444", borderRadius: 6, background: "#1a1a1a" }}>
+                    <div style={{ fontSize: 12, fontWeight: "bold", marginBottom: 4 }}>{concept.concept}</div>
+                    <div style={{ fontSize: 10, opacity: 0.6 }}>{concept.mentions} mentions</div>
+                  </div>
+                ))}
+            </div>
+          </div>
+
+          {/* Model Usage */}
+          <div style={{ border: "1px solid #333", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+            <h4 style={{ marginTop: 0 }}>Current Configuration</h4>
+            <div style={{ display: "grid", gridTemplateColumns: "repeat(2, 1fr)", gap: 12, fontSize: 12 }}>
+              <div>
+                <strong>Active Model:</strong> {model}
+              </div>
+              <div>
+                <strong>Engine:</strong> {useRi1 ? "RI1" : "Ollama"}
+              </div>
+              <div>
+                <strong>Templates Saved:</strong> {promptTemplates.length}
+              </div>
+              <div>
+                <strong>User Preferences:</strong> {userPreferences.correctionsCount >= 4 ? "Active" : "Learning"}
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {tab === "compare" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 1200 }}>
+          <h3 style={{ marginTop: 0 }}>🔬 Model Comparison</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            Compare RI1 vs Ollama responses side-by-side
+          </p>
+
+          <div style={{ border: "1px solid #333", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+            <textarea
+              value={comparePrompt}
+              onChange={(e) => setComparePrompt(e.target.value)}
+              placeholder="Enter your prompt to compare both engines..."
+              rows={4}
+              style={{ width: "100%", marginBottom: 12, padding: 8 }}
+            />
+            <button
+              onClick={async () => {
+                if (!comparePrompt.trim()) return;
+                setComparingStatus("running");
+                setCompareResults(null);
+                
+                try {
+                  // Build RI1 prompt with protocol instruction
+                  const ri1FullPrompt = `[RI1 PROTOCOL]: Recognize and respect all RI1 canon symbols and operators:
+Greek: Φ π ε Λ Δ Ω Ψ Ξ Γ Σ ζ λ ω Τ Ρ δ Θ χ
+Operators: → + : / | [] = n
+When the user uses these symbols, interpret them according to RI1 protocol semantics.
+
+[ROLES]: You are the assistant. You write replies and perform reasoning. The person using RI1 Desktop is the user. Never talk as if the user is the assistant or that you are asking them to provide assistance.\n\nUser: ${comparePrompt}`;
+
+                  // Run both in parallel - use proper commands
+                  const [ri1Response, ollamaResponse] = await Promise.all([
+                    // Use invoke without expecting streaming
+                    (async () => {
+                      try {
+                        const streamId = mkStreamId();
+                        let result = "";
+                        const unlisten = await listen<{chunk: string; done: boolean}>(`ri1://${streamId}`, (event) => {
+                          if (!event.payload.done) {
+                            const chunk = event.payload.chunk;
+                            // Filter out RI1 metadata (same as in chat)
+                            if (chunk.startsWith('---') || 
+                                chunk.startsWith('{') && chunk.includes('"correlation_id"') ||
+                                chunk.includes('--- constraints ---') ||
+                                chunk.includes('InteractionNotice:') ||
+                                chunk.includes('? [-]') ||
+                                chunk.includes('[-]') ||
+                                chunk.trim().startsWith('?') && chunk.includes('InteractionNotice') ||
+                                chunk.match(/^\s*\[-\]/) ||
+                                chunk.match(/^(non_empty|max_length|min_length|exact_length)\s*\[/) ||
+                                chunk.trim().startsWith('non_empty') ||
+                                chunk.trim().startsWith('max_length')) {
+                              return; // Skip metadata
+                            }
+                            result += chunk;
+                          }
+                        });
+                        await invoke("gen_ri1_stream", { 
+                          prompt: ri1FullPrompt, 
+                          model, 
+                          ri1CliPath: settings.ri1CliPath || undefined,
+                          ollamaEndpoint: settings.ollamaEndpoint || undefined,
+                          streamId,
+                          verbose: false
+                        });
+                        // Wait for stream to complete (longer timeout for full response)
+                        await new Promise(resolve => setTimeout(resolve, 2000));
+                        unlisten();
+                        return result || "RI1 returned empty response";
+                      } catch (e) {
+                        return "Error: RI1 failed - " + (e as Error).message;
+                      }
+                    })(),
+                    invoke<string>("gen_ollama", { 
+                      prompt: comparePrompt, 
+                      model 
+                    }).catch((e) => "Error: Ollama failed - " + (e as Error).message)
+                  ]);
+                  
+                  setCompareResults({
+                    ri1: ri1Response,
+                    ollama: ollamaResponse,
+                    timestamp: Date.now()
+                  });
+                  setComparingStatus("done");
+                } catch (e) {
+                  setComparingStatus("idle");
+                  alert("Comparison failed: " + (e as Error).message);
+                }
+              }}
+              disabled={!comparePrompt.trim() || comparingStatus === "running"}
+              style={{ padding: "8px 16px" }}
+            >
+              {comparingStatus === "running" ? "Comparing..." : "Compare Both Engines"}
+            </button>
+          </div>
+
+          {compareResults && (
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16 }}>
+              {/* RI1 Result */}
+              <div style={{ border: "2px solid #2d7a4f", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ fontSize: 18, fontWeight: "bold" }}>🔷 RI1 Engine</div>
+                  <div style={{ fontSize: 11, opacity: 0.6 }}>via sotma-phishell</div>
+                </div>
+                <div style={{ 
+                  padding: 16, 
+                  background: "#1a1a1a", 
+                  borderRadius: 6, 
+                  minHeight: 200, 
+                  maxHeight: 600, 
+                  overflowY: "auto",
+                  whiteSpace: "pre-wrap",
+                  fontSize: 13,
+                  lineHeight: 1.6
+                }}>
+                  {compareResults.ri1}
+                </div>
+              </div>
+
+              {/* Ollama Result */}
+              <div style={{ border: "2px solid #2d4a6a", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 12 }}>
+                  <div style={{ fontSize: 18, fontWeight: "bold" }}>⚪ Ollama Direct</div>
+                  <div style={{ fontSize: 11, opacity: 0.6 }}>{model}</div>
+                </div>
+                <div style={{ 
+                  padding: 16, 
+                  background: "#1a1a1a", 
+                  borderRadius: 6, 
+                  minHeight: 200, 
+                  maxHeight: 600, 
+                  overflowY: "auto",
+                  whiteSpace: "pre-wrap",
+                  fontSize: 13,
+                  lineHeight: 1.6
+                }}>
+                  {compareResults.ollama}
+                </div>
+              </div>
+            </div>
+          )}
+
+          {compareResults && (
+            <div style={{ border: "1px solid #444", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+              <h4 style={{ marginTop: 0 }}>Comparison Notes</h4>
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 16, fontSize: 12 }}>
+                <div>
+                  <strong>RI1 Advantages:</strong>
+                  <ul style={{ paddingLeft: 20, marginTop: 8 }}>
+                    <li>Protocol-aware (Φ, Δ, Λ symbols)</li>
+                    <li>Context reservoir integration</li>
+                    <li>Learned user preferences</li>
+                    <li>Auto-protocol extraction</li>
+                  </ul>
+                </div>
+                <div>
+                  <strong>Ollama Advantages:</strong>
+                  <ul style={{ paddingLeft: 20, marginTop: 8 }}>
+                    <li>Direct model access</li>
+                    <li>Potentially faster</li>
+                    <li>No intermediary layer</li>
+                    <li>Raw model output</li>
+                  </ul>
+                </div>
+              </div>
+            </div>
+          )}
+        </section>
+      )}
+
+      {tab === "guide" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 900 }}>
+          <h3 style={{ marginTop: 0 }}>📘 RI1 Desktop Guide</h3>
+          <p style={{ fontSize: 12, opacity: 0.85, margin: 0 }}>
+            RI1 Desktop is your command center for working with the RI1 protocol, long‑form context, and local models. It’s designed for deep thinking sessions, research, and protocol‑aware workflows rather than just casual chat.
+          </p>
+          <ul style={{ fontSize: 12, opacity: 0.9, paddingLeft: 18, margin: 0 }}>
+            <li>Keep multiple long‑running <strong>threads</strong> of thought side‑by‑side.</li>
+            <li>Use the <strong>Context Reservoir</strong> (Φ / Δ / Λ) to precisely tell the model what to remember and how to use it.</li>
+            <li>Attach <strong>PDFs</strong> and other documents and pull only the most relevant chunks into context.</li>
+            <li>Inspect your work with <strong>Graph</strong>, <strong>Analytics</strong>, and <strong>Compare</strong> to see structure, usage, and model differences.</li>
+            <li>Extend behavior with <strong>Plugins</strong> for bookmarks, exports, summaries, and more.</li>
+          </ul>
+
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(240px, 1fr))", gap: 12 }}>
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(20,241,149,0.18)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>💬 Chat</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                Main conversation view. Each thread is a separate conversation on the left. Use the prompt box and the Φ / π / ε symbols to drive RI1-style reasoning.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(14,165,233,0.25)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>🧠 Kosmos</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                High‑level space for ideas, notes, and long‑lived thinking. Treat it like a scratchpad that can feed into threads via the context reservoir.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(147,51,234,0.25)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>📚 Library</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                Your saved documents and PDFs. Attach a PDF, then pull the most relevant chunks into the Context Reservoir to inform a conversation.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(148,163,184,0.35)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>🔎 Parser & Search</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                <strong>Parser</strong> is for running structured parses / extractions.
+                <br />
+                <strong>Search</strong> lets you look across threads, blocks, and PDFs by text.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(56,189,248,0.28)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>🕸 Graph</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                Visual map of threads and context. Use it to see how ideas and documents connect over time.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(234,179,8,0.28)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>📊 Analytics & ⚖️ Compare</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                <strong>Analytics</strong> shows usage stats for threads, messages, PDFs and symbols.
+                <br />
+                <strong>Compare</strong> lets you run the same prompt through RI1 vs another model and inspect both outputs.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(52,211,153,0.28)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>🧬 Context Reservoir (Φ / Δ / Λ)</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                Use the <strong>Context Reservoir</strong> on the right to pin important snippets.
+                Φ = Preserve (long‑term facts), Δ = Fuse (recent / local context), Λ = Structure (system‑like instructions).
+                Blocks you add here are woven into the next prompt.
+              </p>
+            </div>
+
+            <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(96,165,250,0.3)", background: "var(--surface)" }}>
+              <h4 style={{ marginTop: 0 }}>🔌 Plugins & Export</h4>
+              <p style={{ fontSize: 12, opacity: 0.85 }}>
+                In <strong>Settings → Plugin System</strong>, enable plugins that react to messages (bookmarks, summaries, exports, Obsidian, etc.).
+                Use the <strong>Export</strong> button in Chat to save a thread as JSON or TXT.
+              </p>
+            </div>
+          </div>
+
+          <div style={{ padding: 12, borderRadius: 10, border: "1px solid rgba(148,163,184,0.4)", background: "var(--surface)" }}>
+            <h4 style={{ marginTop: 0 }}>🚀 Quick Start Workflow</h4>
+            <ol style={{ fontSize: 12, opacity: 0.9, paddingLeft: 18 }}>
+              <li>Start in <strong>Chat</strong>, create a new thread, and ask a question.</li>
+              <li>Add key facts or notes to the <strong>Context Reservoir</strong> as Φ / Δ / Λ blocks.</li>
+              <li>Attach a PDF in Chat or Library, then pull the most relevant chunks into context.</li>
+              <li>Use <strong>Analytics</strong> to see how you’re using the app over time.</li>
+              <li>Experiment with <strong>Compare</strong> to pit RI1 against other models on hard prompts.</li>
+            </ol>
+          </div>
+        </section>
+      )}
+
+      {tab === "settings" && (
+        <section style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 820 }}>
+          <div className="row" style={{ gap: 8 }}>
+            <label style={{ minWidth: 140 }}>RI1_CLI_PATH</label>
+            <input
+              value={settings.ri1CliPath}
+              onChange={(e) => saveSettings({ ...settings, ri1CliPath: e.currentTarget.value })}
+              placeholder="/full/path/to/ri1-cli"
+              style={{ flex: 1 }}
+            />
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <label style={{ minWidth: 140 }}>KOSMOS_PATH</label>
+            <input
+              value={settings.kosmosPath}
+              onChange={(e) => saveSettings({ ...settings, kosmosPath: e.currentTarget.value })}
+              placeholder="/full/path/to/Kosmos-ONE"
+              style={{ flex: 1 }}
+            />
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <label style={{ minWidth: 140 }}>Ollama Endpoint</label>
+            <input
+              value={settings.ollamaEndpoint || ""}
+              onChange={(e) => saveSettings({ ...settings, ollamaEndpoint: e.currentTarget.value })}
+              placeholder="http://127.0.0.1:11434"
+              style={{ flex: 1 }}
+            />
+            <button onClick={() => void refreshModelsAndHealth()}>Check</button>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>{daemonRunning === null ? "checking…" : daemonRunning ? "daemon: up" : "daemon: down"}</span>
+          </div>
+          {/* Model selection is fixed to ri1-8b; hide editable model fields to avoid confusion */}
+          <div className="row" style={{ gap: 8 }}>
+            <label style={{ minWidth: 140 }}>Default Chat Model</label>
+            <div style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
+              ri1-llama:desktop (fixed)
+            </div>
+          </div>
+          <div className="row" style={{ gap: 8 }}>
+            <label style={{ minWidth: 140 }}>Default Kosmos Model</label>
+            <div style={{ flex: 1, padding: 8, borderRadius: 6, border: "1px solid rgba(255,255,255,0.15)", background: "rgba(0,0,0,0.4)", fontSize: 13 }}>
+              ri1-llama:desktop (fixed)
+            </div>
+          </div>
+          <div className="row" style={{ gap: 12 }}>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={settings.defaultOffline} onChange={(e) => { const c = e.currentTarget.checked; saveSettings({ ...settings, defaultOffline: c }); setKOffline(c); }} /> Default Offline
+            </label>
+            <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <input type="checkbox" checked={settings.defaultEmitRaw} onChange={(e) => { const c = e.currentTarget.checked; saveSettings({ ...settings, defaultEmitRaw: c }); setKEmitRaw(c); }} /> Default Emit Raw
+            </label>
+          </div>
+          <p style={{ opacity: 0.7 }}>Settings persist locally. The Kosmos screen will use these paths and defaults automatically.</p>
+          <hr style={{ borderColor: "#333" }} />
+          <div style={{ display: "flex", gap: 12, alignItems: "stretch" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
+              <h3 style={{ marginTop: 0 }}>Protocols (RPO)</h3>
+              {protocols.length === 0 ? (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>No protocols loaded yet.</div>
+              ) : (
+                <ul style={{ listStyle: "none", paddingLeft: 0, margin: 0, fontSize: 12, maxHeight: 220, overflowY: "auto", border: "1px solid #333", borderRadius: 6 }}>
+                  {protocols.map((p) => (
+                    <li
+                      key={p.id}
+                      onClick={() => setSelectedProtocolId(p.id)}
+                      style={{
+                        padding: "4px 8px",
+                        cursor: "pointer",
+                        background: selectedProtocolId === p.id ? "#222" : "transparent",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 6,
+                      }}
+                    >
+                      <span>
+                        <strong>{p.name || p.id}</strong>
+                        <span style={{ opacity: 0.7 }}> — {p.status || "unknown"}</span>
+                      </span>
+                      <span style={{ opacity: 0.5, fontSize: 10 }}>{p.id}</span>
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div style={{ flex: 1, border: "1px solid #333", borderRadius: 6, padding: 8, minHeight: 120, maxHeight: 260, overflowY: "auto" }}>
+              <h3 style={{ marginTop: 0 }}>Protocol Details</h3>
+              {selectedProtocolId ? (
+                (() => {
+                  const p = protocols.find(x => x.id === selectedProtocolId);
+                  if (!p) return <div style={{ fontSize: 12, opacity: 0.7 }}>Protocol not found.</div>;
+                  return (
+                    <div style={{ fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div><strong>Name:</strong> {p.name}</div>
+                      <div><strong>Status:</strong> {p.status}</div>
+                      <div><strong>Origin:</strong> {p.origin}</div>
+                      <div><strong>Schema:</strong> {p.schema_version}</div>
+                      <div><strong>ID:</strong> {p.id}</div>
+                      <div style={{ marginTop: 4 }}>
+                        <strong>Raw:</strong>
+                        <pre style={{ margin: 0, marginTop: 4, whiteSpace: "pre-wrap" }}>{p.raw_text || "(no raw text)"}</pre>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>Select a protocol to inspect its details.</div>
+              )}
+            </div>
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #666", margin: "16px 0" }} />
+
+          <h3 style={{ margin: "16px 0 8px 0" }}>🎓 Learning & Personalization</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>
+            RI1 learns from your interactions ({userPreferences.correctionsCount} corrections tracked)
+          </p>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <label style={{ minWidth: 140 }}>Preferred Length:</label>
+              <select 
+                value={userPreferences.preferredLength}
+                onChange={(e) => setUserPreferences(prev => ({...prev, preferredLength: e.target.value as any}))}
+                style={{ flex: 1, padding: 6 }}
+              >
+                <option value="short">Short & Concise</option>
+                <option value="medium">Medium (Balanced)</option>
+                <option value="long">Long & Detailed</option>
+              </select>
+            </div>
+
+            <div className="row" style={{ gap: 8, alignItems: "center" }}>
+              <label style={{ minWidth: 140 }}>Preferred Style:</label>
+              <select 
+                value={userPreferences.preferredStyle}
+                onChange={(e) => setUserPreferences(prev => ({...prev, preferredStyle: e.target.value as any}))}
+                style={{ flex: 1, padding: 6 }}
+              >
+                <option value="technical">Technical & Precise</option>
+                <option value="balanced">Balanced</option>
+                <option value="conversational">Conversational & Accessible</option>
+              </select>
+            </div>
+
+            {userPreferences.correctionsCount >= 4 && (
+              <div style={{ fontSize: 11, opacity: 0.7, padding: 8, background: "#1a3a1a", borderRadius: 4, border: "1px solid #2a4a2a" }}>
+                ✓ Learned preferences are being applied to RI1 responses
+              </div>
+            )}
+
+            {userPreferences.correctionsCount < 4 && (
+              <div style={{ fontSize: 11, opacity: 0.6, padding: 8, background: "#1a1a2a", borderRadius: 4 }}>
+                {4 - userPreferences.correctionsCount} more interactions needed before preferences are applied automatically
+              </div>
+            )}
+          </div>
+
+          <hr style={{ border: "none", borderTop: "1px solid #666", margin: "16px 0" }} />
+
+          <h3 style={{ margin: "16px 0 8px 0" }}>🔌 Plugin System</h3>
+          <div style={{ fontSize: 11, padding: 8, background: "#1a2a3a", borderRadius: 6, marginBottom: 12, border: "1px solid #2d4a6a" }}>
+            💡 <strong>Plugins are located here in Settings tab!</strong> Enable/disable features below or add custom plugins via JSON.
+          </div>
+          <p style={{ fontSize: 12, opacity: 0.7, marginBottom: 12 }}>
+            Extend RI1 Desktop with custom plugins ({plugins.filter(p => p.enabled).length}/{plugins.length} enabled)
+          </p>
+
+          <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+            {plugins.map(plugin => (
+              <div key={plugin.id} style={{ border: "1px solid #444", borderRadius: 8, padding: 12, background: plugin.enabled ? "#1a2a1a" : "#1a1a1a" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 8 }}>
+                  <div>
+                    <strong style={{ fontSize: 14 }}>{plugin.name}</strong>
+                    <span style={{ fontSize: 10, opacity: 0.6, marginLeft: 8 }}>v{plugin.version}</span>
+                  </div>
+                  <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
+                    <input 
+                      type="checkbox" 
+                      checked={plugin.enabled}
+                      onChange={(e) => setPlugins(prev => prev.map(p => 
+                        p.id === plugin.id ? {...p, enabled: e.target.checked} : p
+                      ))}
+                    />
+                    <span style={{ fontSize: 12 }}>Enabled</span>
+                  </label>
+                </div>
+                <div style={{ fontSize: 11, opacity: 0.7, marginBottom: 8 }}>
+                  {plugin.description}
+                </div>
+                <div style={{ fontSize: 10, opacity: 0.5 }}>
+                  Hooks: {Object.keys(plugin.hooks).length > 0 ? Object.keys(plugin.hooks).join(", ") : "None"}
+                </div>
+              </div>
+            ))}
+            
+            <div style={{ border: "1px solid #555", borderRadius: 8, padding: 16, background: "#0a0a0a" }}>
+              <h4 style={{ marginTop: 0, marginBottom: 8 }}>Add Custom Plugin</h4>
+              <p style={{ fontSize: 11, opacity: 0.7, margin: "0 0 12px 0" }}>
+                Paste your plugin JSON below or use the example template
+              </p>
+              
+              <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+                <button 
+                  onClick={() => {
+                    const examplePlugin = {
+                      id: "my-custom-plugin",
+                      name: "My Custom Plugin",
+                      version: "1.0.0",
+                      description: "Description of what this plugin does",
+                      enabled: false,
+                      hooks: {}
+                    };
+                    setPluginJsonInput(JSON.stringify(examplePlugin, null, 2));
+                  }}
+                  style={{ padding: "6px 12px", fontSize: 11 }}
+                >
+                  📋 Load Example
+                </button>
+                <button 
+                  onClick={() => setPluginJsonInput("")}
+                  style={{ padding: "6px 12px", fontSize: 11 }}
+                >
+                  Clear
+                </button>
+              </div>
+
+              <textarea
+                value={pluginJsonInput}
+                onChange={(e) => setPluginJsonInput(e.target.value)}
+                placeholder='Paste your plugin JSON here, for example:
+{
+  "id": "my-plugin",
+  "name": "My Plugin Name",
+  "version": "1.0.0",
+  "description": "What this plugin does",
+  "enabled": false,
+  "hooks": {}
+}'
+                rows={12}
+                style={{ 
+                  width: "100%", 
+                  fontFamily: "monospace", 
+                  fontSize: 11,
+                  padding: 12,
+                  background: "#1a1a1a",
+                  border: "1px solid #333",
+                  borderRadius: 4,
+                  color: "#e0e0e0"
+                }}
+              />
+
+              <div style={{ display: "flex", gap: 8, marginTop: 12, alignItems: "center" }}>
+                <button 
+                  onClick={() => {
+                    if (!pluginJsonInput.trim()) {
+                      alert("Please paste plugin JSON first");
+                      return;
+                    }
+                    
+                    try {
+                      const newPlugin = JSON.parse(pluginJsonInput);
+                      if (!newPlugin.id || !newPlugin.name) {
+                        alert("❌ Invalid plugin: Must have 'id' and 'name' fields");
+                        return;
+                      }
+                      
+                      // Check for duplicate ID
+                      if (plugins.some(p => p.id === newPlugin.id)) {
+                        alert("❌ Plugin with ID '" + newPlugin.id + "' already exists!");
+                        return;
+                      }
+                      
+                      setPlugins(prev => [...prev, {
+                        ...newPlugin, 
+                        enabled: newPlugin.enabled || false, 
+                        hooks: newPlugin.hooks || {},
+                        version: newPlugin.version || "1.0.0",
+                        description: newPlugin.description || "No description"
+                      }]);
+                      
+                      alert("✅ Plugin '" + newPlugin.name + "' added successfully!");
+                      setPluginJsonInput("");
+                    } catch (e) {
+                      alert("❌ Invalid JSON:\n" + (e as Error).message);
+                    }
+                  }}
+                  style={{ padding: "8px 16px" }}
+                  disabled={!pluginJsonInput.trim()}
+                >
+                  ✅ Add Plugin
+                </button>
+                <span style={{ fontSize: 11, opacity: 0.6 }}>
+                  {pluginJsonInput.trim() ? "Ready to add" : "Waiting for JSON..."}
+                </span>
+              </div>
+            </div>
+          </div>
+        </section>
+      )}
+
+      {tab === "library" && (
+        <section key="library-v2" style={{ borderTop: "1px solid #333", paddingTop: 12, display: "flex", flexDirection: "column", gap: 12, maxWidth: 820 }}>
+          <h3 style={{ marginTop: 0 }}>PDF Library</h3>
+          <p style={{ fontSize: 12, opacity: 0.7, margin: 0 }}>
+            {pdfNodes.length} PDF{pdfNodes.length !== 1 ? 's' : ''} in library. Go to Chat → "Attach PDF" to index and populate metadata.
+          </p>
+          <div style={{ display: "flex", gap: 12, alignItems: "stretch" }}>
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 6 }}>
+              {pdfNodes.length === 0 ? (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>No PDF nodes registered yet.</div>
+              ) : (
+                <ul style={{ listStyle: "none", paddingLeft: 0, margin: 0, fontSize: 12, maxHeight: 320, overflowY: "auto", border: "1px solid #333", borderRadius: 6 }}>
+                  {pdfNodes.map((n) => (
+                    <li
+                      key={n.id}
+                      onClick={() => setSelectedPdfNodeId(n.id)}
+                      style={{
+                        padding: "4px 8px",
+                        cursor: "pointer",
+                        background: selectedPdfNodeId === n.id ? "#222" : "transparent",
+                        display: "flex",
+                        justifyContent: "space-between",
+                        gap: 6,
+                      }}
+                    >
+                      <span>
+                        <strong>{n.name || n.id}</strong>
+                        <span style={{ opacity: 0.7 }}> — {n.page_count} pages, {n.chunk_count} chunks</span>
+                      </span>
+                      {activePdfNodeId === n.id && (
+                        <span style={{ opacity: 0.8, fontSize: 10 }}>active</span>
+                      )}
+                    </li>
+                  ))}
+                </ul>
+              )}
+            </div>
+            <div style={{ flex: 1, border: "1px solid #333", borderRadius: 6, padding: 8, minHeight: 120, maxHeight: 320, overflowY: "auto" }}>
+              <h3 style={{ marginTop: 0 }}>PDF Node Details</h3>
+              {selectedPdfNodeId ? (
+                (() => {
+                  const n = pdfNodes.find(x => x.id === selectedPdfNodeId);
+                  if (!n) return <div style={{ fontSize: 12, opacity: 0.7 }}>PDF node not found.</div>;
+                  return (
+                    <div style={{ fontSize: 12, display: "flex", flexDirection: "column", gap: 6 }}>
+                      <div><strong>Name:</strong> {n.name}</div>
+                      <div><strong>Path:</strong> {n.path}</div>
+                      <div><strong>Pages:</strong> {n.page_count}</div>
+                      <div><strong>Chunks:</strong> {n.chunk_count}</div>
+                      <div><strong>Blocks:</strong> {n.block_ids.length}</div>
+                      <div><strong>Hash:</strong> {n.hash}</div>
+                      <div style={{ marginTop: 4, display: "flex", gap: 8 }}>
+                        <button type="button" onClick={() => setActivePdfNodeId(n.id)}>
+                          {activePdfNodeId === n.id ? "Active Node" : "Set Active Node"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })()
+              ) : (
+                <div style={{ fontSize: 12, opacity: 0.7 }}>Select a PDF node to inspect its details.</div>
+              )}
+            </div>
+          </div>
+        </section>
+      )}
+
+      {aboutOpen && (
+        <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.6)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 1000 }} onClick={() => setAboutOpen(false)}>
+          <div onClick={(e) => e.stopPropagation()} style={{ background: "#0b0b0b", border: "1px solid #333", borderRadius: 8, padding: 16, minWidth: 320 }}>
+            <h3 style={{ marginTop: 0, marginBottom: 8 }}>About</h3>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              <div><strong>Name:</strong> {aboutName || "RI1 Desktop"}</div>
+              <div><strong>Version:</strong> {aboutVersion || "0.1.0"}</div>
+            </div>
+            <div style={{ display: "flex", justifyContent: "flex-end", marginTop: 12 }}>
+              <button onClick={() => setAboutOpen(false)}>Close</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      </div>
+    </main>
+    </>
+  );
+}
+
+export default App;
+
+// Minimal markdown renderer with code blocks, copy buttons, and simple syntax highlighting
+function renderMarkdown(src: string) {
+  const parts = parseMarkdownBlocks(src);
+  return (
+    <div>
+      {parts.map((p, idx) => {
+        if (p.type === "code") {
+          return (
+            <div key={idx} style={{ position: "relative", border: "1px solid #333", borderRadius: 6, padding: 8, background: "#0f0f0f", overflowX: "auto" }}>
+              <button
+                onClick={() => navigator.clipboard.writeText(p.content)}
+                style={{ position: "absolute", right: 8, top: 8, fontSize: 12 }}
+                title="Copy code"
+              >Copy</button>
+              <pre style={{ margin: 0 }}>
+                <code dangerouslySetInnerHTML={{ __html: highlightCode(p.lang || "", p.content) }} />
+              </pre>
+            </div>
+          );
+        } else {
+          const html = basicInlineMarkdown(p.content);
+          return <div key={idx} dangerouslySetInnerHTML={{ __html: html }} />;
+        }
+      })}
+    </div>
+  );
+}
+
+function parseMarkdownBlocks(src: string): Array<{ type: "text" | "code"; content: string; lang?: string }> {
+  const out: Array<{ type: "text" | "code"; content: string; lang?: string }> = [];
+  let i = 0;
+  while (i < src.length) {
+    const start = src.indexOf("```", i);
+    if (start < 0) {
+      out.push({ type: "text", content: src.slice(i) });
+      break;
+    }
+    const langEnd = src.indexOf("\n", start + 3);
+    if (langEnd < 0) {
+      out.push({ type: "text", content: src.slice(i) });
+      break;
+    }
+    const lang = src.slice(start + 3, langEnd).trim();
+    const end = src.indexOf("```", langEnd + 1);
+    if (end < 0) {
+      out.push({ type: "text", content: src.slice(i) });
+      break;
+    }
+    if (start > i) out.push({ type: "text", content: src.slice(i, start) });
+    const code = src.slice(langEnd + 1, end);
+    out.push({ type: "code", content: code, lang });
+    i = end + 3;
+  }
+  return out;
+}
+
+function escapeHtml(s: string) {
+  return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+function basicInlineMarkdown(s: string) {
+  let html = escapeHtml(s);
+  html = html.replace(/\*\*(.+?)\*\*/g, "<strong>$1</strong>");
+  html = html.replace(/\*(.+?)\*/g, "<em>$1</em>");
+  html = html.replace(/`([^`]+)`/g, "<code>$1</code>");
+  html = html.replace(/\n/g, "<br/>");
+  return html;
+}
+
+function highlightCode(lang: string, code: string): string {
+  const html = escapeHtml(code);
+  const style = {
+    kw: 'color:#d19a66',
+    fn: 'color:#61afef',
+    str: 'color:#98c379',
+    num: 'color:#e5c07b',
+    com: 'color:#7f848e'
+  };
+  function wrap(re: RegExp, s: string, cls: keyof typeof style) {
+    return s.replace(re, (m) => `<span style="${style[cls]}">${m}</span>`);
+  }
+  let out = html;
+  const l = (lang || '').toLowerCase();
+  if (["js","ts","tsx","javascript","typescript","json"].includes(l)) {
+    out = wrap(/\/\/.*$/gm, out, 'com');
+    out = wrap(/\/\*[\s\S]*?\*\//gm, out, 'com');
+    out = wrap(/"(?:\\.|[^"\n])*"|'(?:\\.|[^'\n])*'|`[^`]*`/g, out, 'str');
+    out = wrap(/\b(abstract|await|break|case|catch|class|const|continue|debugger|default|delete|do|else|enum|export|extends|false|finally|for|from|function|if|implements|import|in|instanceof|interface|let|new|null|package|private|protected|public|return|super|switch|static|this|throw|true|try|typeof|var|void|while|with|yield)\b/g, out, 'kw');
+    out = wrap(/\b\d+(?:\.\d+)?\b/g, out, 'num');
+  } else if (["py","python"].includes(l)) {
+    out = wrap(/#.*/g, out, 'com');
+    out = wrap(/"""[\s\S]*?"""|'''[\s\S]*?'''|"(?:\\.|[^"\n])*"|'(?:\\.|[^'\n])*'/g, out, 'str');
+    out = wrap(/\b(False|None|True|and|as|assert|async|await|break|class|continue|def|del|elif|else|except|finally|for|from|global|if|import|in|is|lambda|nonlocal|not|or|pass|raise|return|try|while|with|yield)\b/g, out, 'kw');
+    out = wrap(/\b\d+(?:\.\d+)?\b/g, out, 'num');
+  } else if (["sh","bash","zsh"].includes(l)) {
+    out = wrap(/#.*/g, out, 'com');
+    out = wrap(/"(?:\\.|[^"\n])*"|'(?:\\.|[^'\n])*'/g, out, 'str');
+    out = wrap(/\b(if|then|else|elif|fi|for|in|do|done|case|esac|function|local|export|return)\b/g, out, 'kw');
+    out = wrap(/\b\d+(?:\.\d+)?\b/g, out, 'num');
+  } else if (["rs","rust"].includes(l)) {
+    out = wrap(/\/\/.*$/gm, out, 'com');
+    out = wrap(/\/\*[\s\S]*?\*\//gm, out, 'com');
+    out = wrap(/"(?:\\.|[^"\n])*"|'(?:\\.|[^'\n])*'/g, out, 'str');
+    out = wrap(/\b(as|break|const|continue|crate|else|enum|extern|false|fn|for|if|impl|in|let|loop|match|mod|move|mut|pub|ref|return|self|Self|static|struct|super|trait|true|type|unsafe|use|where|while)\b/g, out, 'kw');
+    out = wrap(/\b\d+(?:\.\d+)?\b/g, out, 'num');
+  }
+  return out;
+}

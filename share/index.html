@@ -1,0 +1,205 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>RI1</title>
+<style>
+  :root {
+    --bg: #0b0b0c; --panel: #131315; --line: #2a2a2e; --text: #e8e6e3; --muted: #9a978f;
+    --accent: #c9a96e; --you: #1b1d22; --err: #ff8f8f;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+    font: 16px/1.55 ui-sans-serif, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  .wrap { max-width: 780px; margin: 0 auto; height: 100%; display: flex; flex-direction: column; padding: 0 16px; }
+  header { display: flex; align-items: baseline; gap: 12px; padding: 18px 0 10px; border-bottom: 1px solid var(--line); }
+  header h1 { margin: 0; font-size: 20px; letter-spacing: .04em; }
+  header h1 span { color: var(--accent); }
+  header .meta { color: var(--muted); font-size: 13px; flex: 1; }
+  header label { color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: center; cursor: pointer; }
+  #log { flex: 1; overflow-y: auto; padding: 18px 0; display: flex; flex-direction: column; gap: 14px; }
+  .msg { max-width: 100%; }
+  .msg .who { font-size: 12px; color: var(--muted); margin-bottom: 4px; }
+  .msg .body { white-space: pre-wrap; word-wrap: break-word; }
+  .msg.you .body { background: var(--you); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .msg.err .body { color: var(--err); }
+  .cursor::after { content: "▍"; color: var(--accent); animation: blink 1s steps(1) infinite; }
+  @keyframes blink { 50% { opacity: 0; } }
+  details.src { margin-top: 8px; font-size: 13px; color: var(--muted); }
+  details.src summary { cursor: pointer; }
+  details.src .s { border-left: 2px solid var(--line); padding: 4px 0 4px 10px; margin: 8px 0; }
+  details.src .s b { color: var(--text); }
+  details.src .s .t { white-space: pre-wrap; margin-top: 4px; max-height: 180px; overflow: auto; }
+  form { display: flex; gap: 8px; padding: 12px 0 18px; border-top: 1px solid var(--line); }
+  textarea { flex: 1; resize: none; min-height: 48px; max-height: 180px; background: var(--panel); color: var(--text);
+    border: 1px solid var(--line); border-radius: 10px; padding: 12px; font: inherit; }
+  button { background: var(--accent); color: #111; border: 0; border-radius: 10px; padding: 0 18px; font: inherit; font-weight: 600; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #gate { margin: auto; text-align: center; max-width: 360px; padding: 24px 0; }
+  #gate h1 { font-size: 34px; margin: 0 0 6px; letter-spacing: .06em; }
+  #gate p { color: var(--muted); margin: 0 0 18px; }
+  #gate form { border: 0; padding: 0; }
+  #gate input { flex: 1; background: var(--panel); color: var(--text); border: 1px solid var(--line); border-radius: 10px;
+    padding: 12px; font: inherit; text-align: center; letter-spacing: .08em; }
+  #gateErr { color: var(--err); min-height: 1.5em; margin-top: 10px; font-size: 14px; }
+  .hint { color: var(--muted); font-size: 13px; text-align: center; padding: 30px 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div id="gate">
+    <h1>RI<span style="color:var(--accent)">1</span></h1>
+    <p>Enter the passcode you were given.</p>
+    <form id="gateForm" autocomplete="off">
+      <input id="pass" placeholder="passcode" autofocus>
+      <button>Enter</button>
+    </form>
+    <div id="gateErr"></div>
+  </div>
+
+  <div id="app" style="display:none; height:100%; flex-direction:column;">
+    <header>
+      <h1>RI<span>1</span></h1>
+      <div class="meta" id="meta"></div>
+      <label title="Look up passages in Andrew's RI1 documents and cite them"><input type="checkbox" id="useBasin" checked> RI1 documents</label>
+    </header>
+    <div id="log"><div class="hint" id="hint">Ask anything. Answers drawing on Andrew's RI1 documents cite them as [B1], [B2] — open “sources” under an answer to read the passages.</div></div>
+    <form id="chat">
+      <textarea id="input" placeholder="Message RI1…  (Enter to send, Shift+Enter for a new line)"></textarea>
+      <button id="send">Send</button>
+    </form>
+  </div>
+</div>
+
+<script>
+(() => {
+  let passcode = "";
+  const history = [];   // [{role, content}] kept only in this tab
+  const $ = (id) => document.getElementById(id);
+
+  function el(tag, cls, text) {
+    const e = document.createElement(tag);
+    if (cls) e.className = cls;
+    if (text !== undefined) e.textContent = text;
+    return e;
+  }
+
+  async function check(code) {
+    const r = await fetch("/api/check", { headers: { "X-Passcode": code } });
+    if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || "Wrong passcode.");
+    return r.json();
+  }
+
+  $("gateForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    $("gateErr").textContent = "";
+    const code = $("pass").value.trim();
+    if (!code) return;
+    try {
+      const info = await check(code);
+      passcode = code;
+      $("gate").style.display = "none";
+      $("app").style.display = "flex";
+      $("meta").textContent = info.basin
+        ? `local model · ${info.curated + info.raw} document passages`
+        : "local model · documents not connected";
+      $("input").focus();
+    } catch (err) {
+      $("gateErr").textContent = err.message;
+    }
+  });
+
+  function addMsg(kind, who, text) {
+    const m = el("div", "msg " + kind);
+    m.appendChild(el("div", "who", who));
+    const b = el("div", "body", text);
+    m.appendChild(b);
+    $("log").appendChild(m);
+    $("log").scrollTop = $("log").scrollHeight;
+    return { m, b };
+  }
+
+  function addSources(m, sources) {
+    if (!sources.length) return;
+    const d = el("details", "src");
+    d.appendChild(el("summary", null, `sources (${sources.length})`));
+    for (const s of sources) {
+      const box = el("div", "s");
+      const head = el("div");
+      head.appendChild(el("b", null, `[B${s.n}] ${s.title}`));
+      head.appendChild(document.createTextNode(` — p.${s.page}${s.heading ? " — " + s.heading : ""} · ${s.tier === "T1" ? "curated" : "raw"}`));
+      box.appendChild(head);
+      box.appendChild(el("div", "t", s.text));
+      d.appendChild(box);
+    }
+    m.appendChild(d);
+  }
+
+  async function send(text) {
+    $("hint")?.remove();
+    addMsg("you", "You", text);
+    const { m, b } = addMsg("ai", "RI1", "");
+    b.classList.add("cursor");
+    $("send").disabled = true;
+    let answer = "", sources = [], failed = "";
+    try {
+      const r = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", "X-Passcode": passcode },
+        body: JSON.stringify({ message: text, history, basin: $("useBasin").checked }),
+      });
+      if (!r.ok || !r.body) {
+        failed = (await r.json().catch(() => ({}))).error || `Error ${r.status}`;
+      } else {
+        const reader = r.body.getReader();
+        const dec = new TextDecoder();
+        let buf = "";
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          buf += dec.decode(value, { stream: true });
+          let i;
+          while ((i = buf.indexOf("\n\n")) >= 0) {
+            const raw = buf.slice(0, i); buf = buf.slice(i + 2);
+            const ev = /^event: (.*)$/m.exec(raw)?.[1];
+            const dataLine = /^data: (.*)$/m.exec(raw)?.[1];
+            if (!ev || dataLine === undefined) continue;
+            const data = JSON.parse(dataLine);
+            if (ev === "sources") sources = data;
+            else if (ev === "token") { answer += data; b.textContent = answer; $("log").scrollTop = $("log").scrollHeight; }
+            else if (ev === "error") failed = data;
+          }
+        }
+      }
+    } catch (err) {
+      failed = "Connection lost. The host's Mac may have gone to sleep or stopped sharing.";
+    }
+    b.classList.remove("cursor");
+    if (failed) {
+      m.classList.add("err");
+      b.textContent = answer ? answer + "\n\n[" + failed + "]" : failed;
+    } else {
+      history.push({ role: "user", content: text }, { role: "assistant", content: answer });
+    }
+    addSources(m, sources);
+    $("send").disabled = false;
+    $("input").focus();
+  }
+
+  $("chat").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const t = $("input").value.trim();
+    if (!t || $("send").disabled) return;
+    $("input").value = "";
+    send(t);
+  });
+  $("input").addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); $("chat").requestSubmit(); }
+  });
+})();
+</script>
+</body>
+</html>
