@@ -581,15 +581,33 @@ function App() {
       const endpoint = settings.ollamaEndpoint || "http://127.0.0.1:11434";
       const health = await invoke<{ running: boolean; endpoint: string; models: string[] }>("check_ollama", { endpoint });
       setDaemonRunning((health as any).running);
-      if (health.models && health.models.length > 0) {
-        setAvailableModels(health.models);
-        // If current chat model is not in the list, set to first available model
-        if (!health.models.includes(model)) {
-          setModel(health.models[0]);
+      // Always replace availableModels with the returned list, including empty list
+      const models = health.models || [];
+      setAvailableModels(models);
+
+      // If current chat model is not in the list, set to first available model
+      if (models.length > 0 && !models.includes(model)) {
+        setModel(models[0]);
+      }
+      // If current Kosmos model is not in the list, set to first available model
+      if (models.length > 0 && !models.includes(kModel)) {
+        setKModel(models[0]);
+      }
+      // Update settings defaults if they don't match available models
+      if (models.length > 0) {
+        const newSettings = { ...settings };
+        let settingsChanged = false;
+        if (!models.includes(settings.defaultModel)) {
+          newSettings.defaultModel = models[0];
+          settingsChanged = true;
         }
-        // If current Kosmos model is not in the list, set to first available model
-        if (!health.models.includes(kModel)) {
-          setKModel(health.models[0]);
+        if (!models.includes(settings.kosmosModel)) {
+          newSettings.kosmosModel = models[0];
+          settingsChanged = true;
+        }
+        if (settingsChanged) {
+          setSettings(newSettings);
+          saveSettings(newSettings);
         }
       }
     } catch {
@@ -3467,6 +3485,9 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
                 ))
               )}
             </select>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>
+              {availableModels.length === 0 ? "unknown" : availableModels.includes(settings.defaultModel) ? "available" : "unavailable"}
+            </span>
           </div>
           <div className="row" style={{ gap: 8 }}>
             <label style={{ minWidth: 140 }}>Default Kosmos Model</label>
@@ -3487,6 +3508,9 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
                 ))
               )}
             </select>
+            <span style={{ fontSize: 12, opacity: 0.8 }}>
+              {availableModels.length === 0 ? "unknown" : availableModels.includes(settings.kosmosModel) ? "available" : "unavailable"}
+            </span>
           </div>
           <div className="row" style={{ gap: 12 }}>
             <label style={{ display: "flex", alignItems: "center", gap: 6 }}>
