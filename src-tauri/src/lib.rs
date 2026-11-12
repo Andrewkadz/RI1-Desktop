@@ -848,16 +848,16 @@ async fn gen_ollama_stream(
             }
         };
 
-        // Check cancellation again after spawn
+        // Register child PID immediately after spawning (before cancellation check)
+        registry.insert(stream_topic.clone(), child.id());
+
+        // Check cancellation after spawn and PID registration
         if cancel_token.load(std::sync::atomic::Ordering::SeqCst) {
             let _ = child.kill();
             let _ = child.wait();
             registry.remove(&stream_topic);
             return Ok(());
         }
-
-        // tracked so the Stop button (cancel_stream) can end the request
-        registry.insert(stream_topic.clone(), child.id());
 
         let mut err_msg: Option<String> = None;
         if let Some(stdout) = child.stdout.take() {
