@@ -1017,21 +1017,34 @@ function App() {
   }
 
   async function stopGeneration() {
+    // Capture the request and listener before awaiting cancellation
+    const stoppedStream = currentStream;
+    const stoppedListener = unlistenRef.current;
+
     // Invalidate the active request immediately
     activeRequestId.current = null;
 
-    try {
-      if (currentStream) {
-        await invoke("cancel_stream", { streamId: currentStream.id, backend: currentStream.backend });
-      }
-    } catch {}
-    // Clear stream state on cancellation
-    if (unlistenRef.current) {
-      unlistenRef.current();
+    // Clear state belonging to this request synchronously
+    if (stoppedListener) {
+      stoppedListener();
       unlistenRef.current = null;
     }
     setCurrentStream(null);
     setLoading(false);
+
+    try {
+      if (stoppedStream) {
+        await invoke("cancel_stream", { streamId: stoppedStream.id, backend: stoppedStream.backend });
+      }
+    } catch {}
+
+    // After await, only clear state if we still own it (no newer request started)
+    if (activeRequestId.current === null) {
+      // Still no active request - safe to clear
+      setCurrentStream(null);
+      setLoading(false);
+    }
+    // If a newer request started, preserve its listener and UI state
   }
 
   function lastUserMessage(): Msg | null {
@@ -1257,9 +1270,13 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     updateActiveThreadMessages((prev) => [...prev, { id: userId, role: "user", text: textToSend, fullPrompt }]);
     // Add empty assistant message placeholder with model tracking
     updateActiveThreadMessages((prev) => [...prev, { id: assistantId, role: "assistant", text: "", model, backend: useRi1 ? "ri1" : "ollama" }]);
+
+    // Declare disposer outside try so it's accessible in catch
+    let disposer: (() => void) | null = null;
+
     try {
       // Listen for stream chunks - capture disposer locally
-      const disposer = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
+      disposer = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
         // Verify this event belongs to the active request
         if (activeRequestId.current !== requestId) {
           return; // Ignore events from cancelled/old requests
@@ -1345,13 +1362,15 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     } catch (e: any) {
       // Check if request was cancelled - don't trigger fallback
       if (activeRequestId.current !== requestId) {
-        // Request was cancelled, just cleanup and return
-        if (unlistenRef.current) {
-          unlistenRef.current();
+        // Request was cancelled - dispose our own listener and return
+        // Don't touch shared state (unlistenRef, currentStream, loading) as it may belong to a newer request
+        if (unlistenRef.current === disposer) {
+          // Only clear if we still own the shared reference
           unlistenRef.current = null;
         }
-        setCurrentStream(null);
-        setLoading(false);
+        if (disposer) {
+          disposer(); // Dispose our own listener
+        }
         return;
       }
 
