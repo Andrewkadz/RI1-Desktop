@@ -878,10 +878,17 @@ async fn gen_ollama_stream(
             registry.remove(&stream_topic);
             format!("wait error: {}", e)
         })?;
-        let _ = app.emit(&stream_topic, StreamChunk { chunk: "", done: true });
         registry.remove(&stream_topic);
-        if let Some(e) = err_msg { return Err(format!("ollama: {}", e)); }
-        if status.success() { Ok(()) } else { Err(format!("ollama request failed with status: {}", status)) }
+        // Only emit done on success - failed exits should reach error handling
+        if let Some(e) = err_msg {
+            return Err(format!("ollama: {}", e));
+        }
+        if status.success() {
+            let _ = app.emit(&stream_topic, StreamChunk { chunk: "", done: true });
+            Ok(())
+        } else {
+            Err(format!("ollama request failed with status: {}", status))
+        }
     })
     .await
     .map_err(|e| format!("task join error: {}", e))??;
@@ -1094,9 +1101,14 @@ async fn run_kosmos_stream(
             registry.remove(&stream_topic);
             format!("wait error: {}", e)
         })?;
-        let _ = app.emit(&stream_topic, KosmosChunk { chunk: "", done: true });
         registry.remove(&stream_topic);
-        if status.success() { Ok(()) } else { Err(format!("ri1-cli exited with status: {}", status)) }
+        // Only emit done on success - failed exits should reach error handling
+        if status.success() {
+            let _ = app.emit(&stream_topic, KosmosChunk { chunk: "", done: true });
+            Ok(())
+        } else {
+            Err(format!("ri1-cli exited with status: {}", status))
+        }
     })
     .await
     .map_err(|e| format!("task join error: {}", e))??;
@@ -1219,9 +1231,14 @@ async fn gen_ri1_stream(
             registry.remove(&topic);
             format!("wait error: {}", e)
         })?;
-        let _ = app.emit(&topic, Ri1Chunk { chunk: "", done: true });
         registry.remove(&topic);
-        if status.success() { Ok(()) } else { Err(format!("ri1-cli exited with status: {}", status)) }
+        // Only emit done on success - failed exits should reach error handling
+        if status.success() {
+            let _ = app.emit(&topic, Ri1Chunk { chunk: "", done: true });
+            Ok(())
+        } else {
+            Err(format!("ri1-cli exited with status: {}", status))
+        }
     })
     .await
     .map_err(|e| format!("task join error: {}", e))??;

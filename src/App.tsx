@@ -1258,8 +1258,8 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
     // Add empty assistant message placeholder with model tracking
     updateActiveThreadMessages((prev) => [...prev, { id: assistantId, role: "assistant", text: "", model, backend: useRi1 ? "ri1" : "ollama" }]);
     try {
-      // Listen for stream chunks
-      unlistenRef.current = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
+      // Listen for stream chunks - capture disposer locally
+      const disposer = await listen<{ chunk: string; done: boolean }>(topic, (e) => {
         // Verify this event belongs to the active request
         if (activeRequestId.current !== requestId) {
           return; // Ignore events from cancelled/old requests
@@ -1316,8 +1316,21 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
           }
         }
       });
+
+      // Check ownership before assigning shared reference
+      if (activeRequestId.current !== requestId) {
+        // Request was cancelled during listener registration - dispose immediately
+        disposer();
+        return;
+      }
+
+      // Assign shared reference only if we still own the request
+      unlistenRef.current = disposer;
+
       // Check if request was cancelled before invoking backend
       if (activeRequestId.current !== requestId) {
+        // Dispose our own listener and return
+        disposer();
         return; // Abort - request was cancelled during listener setup
       }
       // Kick off streaming on backend
@@ -1348,11 +1361,39 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
         try {
           const fallbackModel = model || "ri1-llama:desktop";
           const out = await invoke<string>("gen_ollama", { prompt: fullPrompt, model: fallbackModel });
+
+          // Check ownership after fallback response
+          if (activeRequestId.current !== requestId) {
+            // Request was cancelled during fallback - don't update state
+            return;
+          }
+
           updateActiveThreadMessages((prev) => prev.map((m) => (m.id === assistantId ? { ...m, text: out } : m)));
           void ingestProtocolIfPresent(out);
         } catch (ee: any) {
+          // Check ownership in error path
+          if (activeRequestId.current !== requestId) {
+            return; // Don't update error state for cancelled request
+          }
           setError(ee?.toString?.() ?? e?.toString?.() ?? "Unknown error");
         } finally {
+          // Only clear shared state if we still own the request
+          if (activeRequestId.current === requestId) {
+            setLoading(false);
+            if (unlistenRef.current) {
+              unlistenRef.current();
+              unlistenRef.current = null;
+            }
+            setCurrentStream(null);
+            setPrompt("");
+            activeRequestId.current = null;
+          }
+        }
+      } else {
+        // RI1 streaming failed - show error without fallback
+        // Check ownership before updating error state
+        if (activeRequestId.current === requestId) {
+          setError(e?.toString?.() ?? "RI1 streaming failed");
           setLoading(false);
           if (unlistenRef.current) {
             unlistenRef.current();
@@ -1362,17 +1403,6 @@ When the user uses these symbols, interpret them according to RI1 protocol seman
           setPrompt("");
           activeRequestId.current = null;
         }
-      } else {
-        // RI1 streaming failed - show error without fallback
-        setError(e?.toString?.() ?? "RI1 streaming failed");
-        setLoading(false);
-        if (unlistenRef.current) {
-          unlistenRef.current();
-          unlistenRef.current = null;
-        }
-        setCurrentStream(null);
-        setPrompt("");
-        activeRequestId.current = null;
       }
     }
   }
