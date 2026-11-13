@@ -7,6 +7,8 @@ pub use influence::{InfluenceSnapshot, OperatorWeight, InfluenceEdge, compute_in
 mod interaction;
 use interaction::validate::validate_interactions;
 use interaction::rules::ValidatorConfig;
+pub mod expression;
+pub use expression::{ExpressionParser, ParsedExpression, ExpressionGroup, Token, TokenKind};
 
 pub struct MetaEngineImpl {
     inner: SymbolicEngine,

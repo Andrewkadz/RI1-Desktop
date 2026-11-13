@@ -10,12 +10,11 @@ pub struct Orchestrator {
     constraint_engine: Option<Arc<dyn ConstraintEngine>>, // legacy engine
     meta_engine: Option<Arc<dyn MetaEngine>>,             // preferred meta engine
     last_meta_log: Vec<ResonanceEvent>,
-    last_results: Vec<ConstraintResult>,
 }
 
 impl Orchestrator {
     pub fn new() -> Self {
-        Self { registry: HashMap::new(), constraint_engine: None, meta_engine: None, last_meta_log: Vec::new(), last_results: Vec::new() }
+        Self { registry: HashMap::new(), constraint_engine: None, meta_engine: None, last_meta_log: Vec::new() }
     }
 
     pub fn register_modality_arc<M: Modality + 'static>(&mut self, m: Arc<M>) {
@@ -66,7 +65,7 @@ impl Orchestrator {
     }
     pub fn last_meta_events(&self) -> &Vec<ResonanceEvent> { &self.last_meta_log }
 
-    pub fn generate(&self, modality: &str, req: GenerationRequest) -> Option<GenerationResponse> {
+    pub fn generate_with_evaluation(&self, modality: &str, req: GenerationRequest) -> Option<(GenerationResponse, Vec<ConstraintResult>, Vec<ResonanceEvent>)> {
         match self.registry.get(modality) {
             Some(m) => {
                 let out = m.generate(req);
@@ -84,9 +83,7 @@ impl Orchestrator {
                         warn!("generation_blocked_by_hard_constraint");
                         return None;
                     }
-                    // store logs
-                    // NOTE: using interior mutability would avoid &self, but keep simple for now by shadowing
-                    // (we won't expose mutation of logs here to keep API simple in Phase 2 scaffold)
+                    Some((out, results, events))
                 } else if let Some(engine) = &self.constraint_engine {
                     let results = engine.evaluate(modality, &out.content);
                     let hard_fail = results.iter().any(|r| !r.passed && r.severity == Severity::Hard);
@@ -94,14 +91,20 @@ impl Orchestrator {
                         warn!("generation_blocked_by_hard_constraint");
                         return None;
                     }
+                    Some((out, results, Vec::new()))
+                } else {
+                    Some((out, Vec::new(), Vec::new()))
                 }
-                Some(out)
             }
             None => {
                 warn!("unknown_modality = {}", modality);
                 None
             }
         }
+    }
+
+    pub fn generate(&self, modality: &str, req: GenerationRequest) -> Option<GenerationResponse> {
+        self.generate_with_evaluation(modality, req).map(|(response, _, _)| response)
     }
 }
 

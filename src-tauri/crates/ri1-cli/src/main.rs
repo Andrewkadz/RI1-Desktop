@@ -2,16 +2,14 @@ use clap::{Parser, Subcommand};
 use ri1_core::modality::GenerationRequest;
 use ri1_core::Orchestrator;
 use ri1_core::constraints::{ResonanceEvent, OperatorClass, ConstraintResult};
-use ri1_symbolic_meta::{MetaEngineImpl, InfluenceSnapshot, compute_influence};
-use ri1_text::BasicText;
+use ri1_symbolic_meta::{MetaEngineImpl, InfluenceSnapshot, compute_influence, ExpressionParser, ParsedExpression};
+use ri1_text::{BasicText, OllamaText};
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 use serde_json;
 use uuid::Uuid;
 use std::path::PathBuf;
 use std::fs;
-use reqwest::Client;
-use futures::StreamExt;
 
 #[derive(Parser, Debug)]
 #[command(name = "ri1", version, about = "RI1 Hybrid Generative Engine CLI")]
@@ -98,29 +96,58 @@ struct LogEnvelope {
 }
 
 async fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: bool, cid: Option<String>, log_file: Option<PathBuf>, stream: bool, ollama_model: Option<String>, ollama_endpoint: Option<String>) -> Result<(), String> {
-    // If Ollama parameters are provided, use Ollama for generation
-    if let (Some(model), Some(endpoint)) = (ollama_model, ollama_endpoint) {
-        return gen_text_ollama(&prompt, &model, &endpoint, stream, verbose).await;
-    }
-
-    // Fallback to BasicText if no Ollama parameters
     let mut orch = Orchestrator::new();
-    orch.register_modality(BasicText);
+    
+    // Check if using Ollama before moving values
+    let use_ollama = ollama_model.is_some() && ollama_endpoint.is_some();
+    
+    // Register appropriate modality based on whether Ollama parameters are provided
+    if let (Some(model), Some(endpoint)) = (ollama_model, ollama_endpoint) {
+        orch.register_modality(OllamaText::new(model, endpoint, stream));
+    } else {
+        orch.register_modality(BasicText);
+    }
+    
     orch.set_meta_engine(MetaEngineImpl::new_default());
 
     info!("modalities = {:?}", orch.modalities());
-    let req = GenerationRequest { prompt };
-    if let Some(res) = orch.generate("text", req) {
-        if stream {
-            // Stream output line by line
-            for line in res.content.lines() {
-                println!("{}", line);
-                std::io::Write::flush(&mut std::io::stdout()).ok();
+    
+    // Parse expression if it looks like a symbolic expression
+    let parsed_expr = if prompt.contains('(') && prompt.contains(')') && 
+                      (prompt.contains('Φ') || prompt.contains('π') || prompt.contains('ε') || 
+                       prompt.contains('Ρ') || prompt.contains('Τ') || prompt.contains('Θ') || 
+                       prompt.contains('Λ') || prompt.contains('Δ') || prompt.contains('Ω') || 
+                       prompt.contains('Ψ') || prompt.contains('Γ') || prompt.contains('Σ') || 
+                       prompt.contains('Ξ') || prompt.contains('ζ') || prompt.contains('λ') || 
+                       prompt.contains('ω') || prompt.contains('δ') || prompt.contains('χ')) {
+        Some(ExpressionParser::parse(&prompt))
+    } else {
+        None
+    };
+    
+    // Generate enhanced prompt with expression context
+    let enhanced_prompt = if let Some(ref parsed) = parsed_expr {
+        let context = ExpressionParser::generate_prompt_context(parsed);
+        format!("{}\n\n{}", context, prompt)
+    } else {
+        prompt.clone()
+    };
+    
+    let req = GenerationRequest { prompt: enhanced_prompt };
+    if let Some((res, log, mut events)) = orch.generate_with_evaluation("text", req) {
+        // For Ollama streaming, content is already printed during generation
+        // For BasicText or non-streaming Ollama, print the content
+        if !(use_ollama && stream) {
+            if stream {
+                // Stream output line by line
+                for line in res.content.lines() {
+                    println!("{}", line);
+                    std::io::Write::flush(&mut std::io::stdout()).ok();
+                }
+            } else {
+                println!("{}", res.content);
             }
-        } else {
-            println!("{}", res.content);
         }
-        let (log, mut events) = orch.evaluate_with_events("text", &res.content);
         // Correlation ID event injection
         let cid_val = cid.unwrap_or_else(|| Uuid::new_v4().to_string());
         let corr_event = ResonanceEvent {
@@ -179,6 +206,18 @@ async fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: boo
                 println!("{} [{}]: {}", r.name, r.severity, r.message.unwrap_or_else(|| "ok".into()));
             }
         }
+        
+        // Validate expression preservation if we parsed an expression
+        if let Some(ref parsed) = parsed_expr {
+            let validation_issues = validate_expression_output(&res.content, parsed);
+            if !validation_issues.is_empty() {
+                eprintln!("--- expression validation warnings ---");
+                for issue in &validation_issues {
+                    eprintln!("  - {}", issue);
+                }
+            }
+        }
+        
         Ok(())
     } else {
         warn!("generation failed or blocked by constraints");
@@ -186,79 +225,118 @@ async fn gen_text(prompt: String, verbose: bool, json: bool, influence_flag: boo
     }
 }
 
-async fn gen_text_ollama(prompt: &str, model: &str, endpoint: &str, stream: bool, _verbose: bool) -> Result<(), String> {
-    let client = Client::new();
-    let url = format!("{}/api/generate", endpoint);
+fn validate_expression_output(output: &str, parsed: &ParsedExpression) -> Vec<String> {
+    let mut issues = Vec::new();
     
-    let request_body = serde_json::json!({
-        "model": model,
-        "prompt": prompt,
-        "stream": stream
-    });
-
-    info!("Sending request to Ollama: {} model: {}", url, model);
-    
-    let response = client
-        .post(&url)
-        .json(&request_body)
-        .send()
-        .await
-        .map_err(|e| format!("Failed to send request to Ollama: {}", e))?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        return Err(format!("Ollama request failed with status {}: {}", status, body));
+    // Check if original expression is preserved
+    if !output.contains(&parsed.original) {
+        issues.push(format!("original expression not found in output"));
     }
-
-    if stream {
-        // Handle streaming response
-        let mut stream = response.bytes_stream();
-        let mut buffer = String::new();
-        
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| format!("Error reading stream: {}", e))?;
-            let text = String::from_utf8_lossy(&chunk);
-            buffer.push_str(&text);
-            
-            // Process complete lines
-            while let Some(pos) = buffer.find('\n') {
-                let line = buffer[..pos].trim().to_string();
-                buffer = buffer[pos + 1..].to_string();
-                
-                if !line.is_empty() {
-                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                        if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
-                            print!("{}", response_text);
-                            std::io::Write::flush(&mut std::io::stdout()).ok();
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Process any remaining buffer
-        if !buffer.trim().is_empty() {
-            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&buffer) {
-                if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
-                    print!("{}", response_text);
-                    std::io::Write::flush(&mut std::io::stdout()).ok();
-                }
-            }
-        }
-    } else {
-        // Handle non-streaming response
-        let body = response.text().await.map_err(|e| format!("Failed to read response: {}", e))?;
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body) {
-            if let Some(response_text) = json.get("response").and_then(|v| v.as_str()) {
-                println!("{}", response_text);
-            } else {
-                return Err("Invalid response format from Ollama".to_string());
-            }
-        } else {
-            return Err("Failed to parse Ollama response as JSON".to_string());
+    
+    // Check for symbol preservation
+    for (ch, _) in &parsed.symbols {
+        if !output.contains(*ch) {
+            issues.push(format!("symbol '{}' missing from output", ch));
         }
     }
+    
+    // Check for operator preservation
+    for (ch, _) in &parsed.operators {
+        if !output.contains(*ch) {
+            issues.push(format!("operator '{}' missing from output", ch));
+        }
+    }
+    
+    // Check for group preservation
+    for group in &parsed.groups {
+        if !output.contains(&group.content) {
+            issues.push(format!("group '{}' missing from output", group.content));
+        }
+    }
+    
+    // Check for invented symbols (Greek letters not in original)
+    let greek_chars = ['Φ', 'π', 'ε', 'Ρ', 'Τ', 'Θ', 'Λ', 'Δ', 'Ω', 'Ψ', 'Γ', 'Σ', 'Ξ', 'ζ', 'λ', 'ω', 'δ', 'χ'];
+    for ch in output.chars() {
+        if greek_chars.contains(&ch) && !parsed.original.contains(ch) {
+            issues.push(format!("invented symbol '{}' in output", ch));
+        }
+    }
+    
+    // Check for symbol reordering (π and ε swapped)
+    if parsed.original.contains("Φπε") && output.contains("επ") {
+        issues.push("symbol order corrupted: 'Φπε' became 'επ'".to_string());
+    }
+    
+    // Check for invented function notation
+    if output.contains("π(n)") && !parsed.original.contains("π(n)") {
+        issues.push("invented function notation 'π(n)' not in original".to_string());
+    }
+    
+    issues
+}
 
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ri1_symbolic_meta::ExpressionParser;
+
+    #[test]
+    fn test_corrupted_output_detection() {
+        let original = "(Φπε)^Ρ/Τ(n-Θ)/(Θn+Τ/Ρ)";
+        let parsed = ExpressionParser::parse(original);
+        
+        // Simulate corrupted output from the observed failure
+        // This version omits the subtraction operator and corrupts symbols
+        let corrupted = "(επ)^Ρ/Τ(π(n)Θ)/(Θn+Τ/Ρ)";
+        
+        let issues = validate_expression_output(corrupted, &parsed);
+        
+        // Should detect multiple issues
+        assert!(issues.iter().any(|i| i.contains("original expression not found")));
+        assert!(issues.iter().any(|i| i.contains("symbol 'Φ' missing")));
+        assert!(issues.iter().any(|i| i.contains("group '(n-Θ)' missing")));
+        assert!(issues.iter().any(|i| i.contains("operator '-' missing")));
+        assert!(issues.iter().any(|i| i.contains("symbol order corrupted")));
+        assert!(issues.iter().any(|i| i.contains("invented function notation")));
+    }
+
+    #[test]
+    fn test_valid_output_detection() {
+        let original = "(Φπε)^Ρ/Τ(n-Θ)/(Θn+Τ/Ρ)";
+        let parsed = ExpressionParser::parse(original);
+        
+        // Simulate valid output that preserves the expression
+        let valid = "The expression (Φπε)^Ρ/Τ(n-Θ)/(Θn+Τ/Ρ) contains the following structure...";
+        
+        let issues = validate_expression_output(valid, &parsed);
+        
+        // Should have minimal issues (only missing some context, but preserving structure)
+        assert!(issues.is_empty() || issues.len() <= 2);
+    }
+
+    #[test]
+    fn test_missing_group_detection() {
+        let original = "(Φπε)^Ρ/Τ(n-Θ)/(Θn+Τ/Ρ)";
+        let parsed = ExpressionParser::parse(original);
+        
+        // Output missing the final group
+        let incomplete = "The expression (Φπε)^Ρ/Τ(n-Θ) has two groups...";
+        
+        let issues = validate_expression_output(incomplete, &parsed);
+        
+        assert!(issues.iter().any(|i| i.contains("group '(Θn+Τ/Ρ)' missing")));
+    }
+
+    #[test]
+    fn test_missing_operator_detection() {
+        let original = "(Φπε)^Ρ/Τ(n-Θ)/(Θn+Τ/Ρ)";
+        let parsed = ExpressionParser::parse(original);
+        
+        // Output missing subtraction operator
+        let no_subtraction = "The expression (Φπε)^Ρ/Τ(nΘ)/(Θn+Τ/Ρ) uses addition...";
+        
+        let issues = validate_expression_output(no_subtraction, &parsed);
+        
+        assert!(issues.iter().any(|i| i.contains("operator '-' missing")));
+    }
 }

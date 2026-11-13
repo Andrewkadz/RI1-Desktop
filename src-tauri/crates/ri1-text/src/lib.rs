@@ -1,5 +1,11 @@
 use ri1_core::modality::{GenerationRequest, GenerationResponse, Modality};
 
+pub mod ollama;
+pub use ollama::OllamaText;
+
+#[cfg(test)]
+mod ollama_tests;
+
 pub struct BasicText;
 
 impl Modality for BasicText {
